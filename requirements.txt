@@ -17,3 +17,4 @@ colorlog>=6.0.0
 mcp[cli]>=1.0.0
 fastmcp>=0.1.0
 langchain-mcp-adapters>=0.0.1
+pytest>=8.0.0

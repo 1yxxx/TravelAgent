@@ -38,3 +38,19 @@ path = "/mcp"        # MCP 挂载路径
 json_response = true
 stateless_http = false
 timeout = 300        # 工具调用超时（秒）
+
+[orchestration]
+enabled = false
+max_retries_per_layer = 1
+strict_validation = false
+
+[memory_switch]
+enabled = true
+soft_message_threshold = 24
+hard_message_threshold = 60
+soft_token_threshold = 3500
+hard_token_threshold = 7000
+
+[a2ui]
+enabled = true
+event_prefix = "@@A2UI@@"

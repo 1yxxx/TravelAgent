@@ -4,7 +4,7 @@ import sys
 import time
 import uuid
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 ROOT_DIR = os.path.dirname(__file__)
 SRC_DIR = os.path.join(ROOT_DIR, "src")
@@ -44,14 +44,45 @@ async def main():
 
         messages.append(HumanMessage(content=user_input))
 
+        precheck = context.precheck_user_request(messages)
+        if not precheck.get("ok", True):
+            print(f"[A2UI] precheck_failed reason={precheck.get('reason')}")
+            print(f"助手：⚠️ 信息不完整：{precheck.get('suggestion', '')}\n")
+            continue
+
+        invoke_messages, memory_meta = await context.prepare_messages_for_invoke(messages)
+        print(
+            f"[A2UI] memory_mode={memory_meta.get('mode')} "
+            f"reason={memory_meta.get('reason')} "
+            f"msg={memory_meta.get('message_count')} tok≈{memory_meta.get('token_estimate')}"
+        )
+
         try:
-            result = await agent.ainvoke({"messages": messages}, config={" configurable": {"session_id": session_id}})
+            result = await agent.ainvoke(
+                {"messages": invoke_messages},
+                config={"configurable": {"session_id": session_id}, "recursion_limit": 20},
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Agent 调用失败: %s", exc)
             print("助手：出错了，请检查后端日志。")
             continue
 
-        messages = result["messages"]
+        try:
+            metric_artifact_id = context.persist_layer_metrics(result)
+            if metric_artifact_id:
+                logger.info("[CLI] persisted layer metrics: %s", metric_artifact_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CLI] failed to persist layer metrics: %s", exc)
+
+        messages = [m for m in result["messages"] if not isinstance(m, SystemMessage)]
+
+        feedback = context.build_quality_feedback(result)
+        if feedback.get("enabled"):
+            print(
+                f"[A2UI] quality={feedback.get('status')} "
+                f"failures={feedback.get('failure_count', 0)}"
+            )
+
         final_text = None
         for m in reversed(messages):
             if isinstance(m, HumanMessage):

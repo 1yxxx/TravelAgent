@@ -90,6 +90,25 @@ class McpServerConfig(ConfigBaseModel):
     timeout: int = 300
 
 
+class OrchestrationConfig(ConfigBaseModel):
+    enabled: bool = False
+    max_retries_per_layer: int = 1
+    strict_validation: bool = False
+
+
+class MemorySwitchConfig(ConfigBaseModel):
+    enabled: bool = True
+    soft_message_threshold: int = 24
+    hard_message_threshold: int = 60
+    soft_token_threshold: int = 3500
+    hard_token_threshold: int = 7000
+
+
+class A2UIConfig(ConfigBaseModel):
+    enabled: bool = True
+    event_prefix: str = "@@A2UI@@"
+
+
 class Settings(ConfigBaseModel):
     developer: DeveloperConfig
     project: ProjectConfig
@@ -97,6 +116,9 @@ class Settings(ConfigBaseModel):
     map: MapConfig
     weather: WeatherConfig
     mcp_server: McpServerConfig = Field(default_factory=McpServerConfig)
+    orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
+    memory_switch: MemorySwitchConfig = Field(default_factory=MemorySwitchConfig)
+    a2ui: A2UIConfig = Field(default_factory=A2UIConfig)
 
 
 def load_settings(config_path: str | Path) -> Settings:

@@ -414,4 +414,31 @@ def register(server: FastMCP, cfg: Settings) -> None:
             logger.error("[MCP fix_json] %s", traceback.format_exc())
             return {"artifact_id": "", "result": str(exc), "isError": True}
 
-    logger.info("[MCP] registered all 14 travel tools")
+    # ── request_travel_info ──────────────────────────────────────────
+    @server.tool(
+        name="request_travel_info",
+        description="当用户的旅行需求信息不完整时调用此工具，弹出表单让用户补充目的地、天数、预算、偏好等信息。只在确实缺少关键信息时调用。",
+    )
+    async def mcp_request_travel_info(
+        mcp_ctx: Context[ServerSession, object],
+        missing_fields: Annotated[str, Field(description="缺少的字段列表，逗号分隔。可选值：destination, days, budget, preference。例如 'destination,days'")] = "",
+        custom_message: Annotated[str, Field(description="友好的提示语，显示在表单上方")] = "",
+    ) -> dict:
+        try:
+            from travel_agent.nodes.core_nodes.request_travel_info import request_travel_info_tool
+            result = request_travel_info_tool.invoke({
+                "missing_fields": missing_fields,
+                "custom_message": custom_message or None,
+            })
+            store = _get_store(mcp_ctx, cfg)
+            meta = store.save_result(
+                node_id="request_travel_info",
+                payload=result,
+                summary=f"表单请求: missing={missing_fields}",
+            )
+            return {"artifact_id": meta.artifact_id, "result": result, "isError": False}
+        except Exception as exc:
+            logger.error("[MCP request_travel_info] %s", traceback.format_exc())
+            return {"artifact_id": "", "result": str(exc), "isError": True}
+
+    logger.info("[MCP] registered all 15 travel tools")

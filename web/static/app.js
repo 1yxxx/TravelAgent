@@ -7,13 +7,97 @@ let ws = null;
 const markers = [];
 let polylines = [];
 
-// ── 持久化 key ─────────────────────────────────────────────────────────────
-const STORAGE_KEY_HISTORY = "travel_chat_history";   // 消息记录
-const STORAGE_KEY_MAP     = "travel_map_state";      // 地图 JSON 块（用于还原标记/行程）
-const MAX_HISTORY_ITEMS   = 60;                       // 最多保留 60 条消息
-let wsReconnectTimer = null;   // 重连定时器
-let wsReconnectDelay = 1500;   // 初始重连间隔(ms)，指数退避
-let wsSendPending = null;      // 等待重连后发送的文本
+// ── 会话管理 ───────────────────────────────────────────────────────────────
+const STORAGE_KEY_SESSIONS = "travel_sessions_v2";   // 会话列表（替代旧的单 key 模式）
+const MAX_SESSIONS          = 50;                     // 最多保留 50 个会话
+const MAX_HISTORY_ITEMS     = 60;                     // 每个会话最多 60 条消息
+const MAX_A2UI_CARDS        = 40;                     // 每个会话最多 40 张 A2UI 卡片
+const A2UI_PREFIX           = "@@A2UI@@";
+let wsReconnectTimer = null;
+let wsReconnectDelay = 1500;
+let wsSendPending = null;
+window._a2uiSavedPlaces = [];
+let _currentSessionId = null;    // 当前活跃会话 ID
+
+/** 读取全部会话数据 */
+function _loadSessions() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY_SESSIONS) || "{}");
+  } catch (e) { return {}; }
+}
+
+/** 保存全部会话数据 */
+function _saveSessions(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(data));
+  } catch (e) { /* quota exceeded, silently ignore */ }
+}
+
+/** 获取或创建当前会话 */
+function _getCurrentSession() {
+  var data = _loadSessions();
+  if (!data.sessions) data.sessions = {};
+  if (!data.order) data.order = [];
+  if (!_currentSessionId || !data.sessions[_currentSessionId]) {
+    // 回退到最后活跃的会话，或创建新会话
+    _currentSessionId = data.active;
+    if (!_currentSessionId || !data.sessions[_currentSessionId]) {
+      _currentSessionId = _newSessionId();
+      data.sessions[_currentSessionId] = _emptySession(_currentSessionId);
+      data.active = _currentSessionId;
+      if (data.order.indexOf(_currentSessionId) === -1) data.order.unshift(_currentSessionId);
+      _saveSessions(data);
+    }
+  }
+  return data;
+}
+
+/** 生成新会话 ID */
+function _newSessionId() {
+  return "s_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+/** 创建空会话对象 */
+function _emptySession(id) {
+  return {
+    id: id,
+    title: "",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    messages: [],
+    mapBlocks: [],
+    a2uiCards: [],
+  };
+}
+
+/** 迁移旧数据（travel_chat_history / travel_map_state / travel_a2ui_cards → 新格式）*/
+function _migrateOldData() {
+  var data = _loadSessions();
+  if (data._migrated) return data;
+  try {
+    var oldHistory = JSON.parse(localStorage.getItem("travel_chat_history") || "[]");
+    var oldMap = JSON.parse(localStorage.getItem("travel_map_state") || "[]");
+    var oldA2ui = JSON.parse(localStorage.getItem("travel_a2ui_cards") || "[]");
+    if (oldHistory.length || oldMap.length || oldA2ui.length) {
+      var id = _newSessionId();
+      data.sessions = data.sessions || {};
+      data.order = data.order || [];
+      data.sessions[id] = {
+        id: id, title: "导入的历史对话", createdAt: Date.now(), updatedAt: Date.now(),
+        messages: oldHistory, mapBlocks: oldMap, a2uiCards: oldA2ui,
+      };
+      data.order.unshift(id);
+      data.active = id;
+      _currentSessionId = id;
+      localStorage.removeItem("travel_chat_history");
+      localStorage.removeItem("travel_map_state");
+      localStorage.removeItem("travel_a2ui_cards");
+    }
+    data._migrated = true;
+    _saveSessions(data);
+  } catch (e) {}
+  return data;
+}
 
 // ── Markdown renderer ─────────────────────────────────────────────────────
 const md = (text) => {
@@ -63,82 +147,144 @@ function appendMessage(role, text, _skipSave) {
   }
 }
 
-// ── localStorage 持久化 ───────────────────────────────────────────────────
-/** 保存一条消息到 localStorage */
+// ── 会话级持久化 ──────────────────────────────────────────────────────────
+
+function _currentSessionData() {
+  var data = _loadSessions();
+  if (!data.sessions || !_currentSessionId) return null;
+  return data.sessions[_currentSessionId] || null;
+}
+
 function _saveMessage(role, text) {
-  try {
-    var history = _loadHistory();
-    history.push({ role: role, text: text, ts: Date.now() });
-    // 超出上限时从头裁剪
-    if (history.length > MAX_HISTORY_ITEMS) {
-      history = history.slice(history.length - MAX_HISTORY_ITEMS);
+  var data = _loadSessions();
+  var s = _currentSessionData();
+  if (!s) return;
+  s.messages.push({ role: role, text: text, ts: Date.now() });
+  if (s.messages.length > MAX_HISTORY_ITEMS) s.messages = s.messages.slice(s.messages.length - MAX_HISTORY_ITEMS);
+  s.updatedAt = Date.now();
+  if (!s.title && role === "user") s.title = text.replace(/\s+/g, " ").slice(0, 30) + (text.length > 30 ? "…" : "");
+  if (role === "assistant") {
+    var _re = /```json\s*([\s\S]*?)```/g, _m;
+    while ((_m = _re.exec(text)) !== null) {
+      try { var _obj = JSON.parse(_m[1].trim()); if (_obj.__type) s.mapBlocks.push(_obj); } catch (_e) {}
     }
-    localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(history));
-    // 同步保存最后一条 assistant 地图块（供地图还原用）
-    if (role === "assistant") {
-      _saveMapBlocks(text);
-    }
-  } catch(e) { /* 存储配额满等极端情况，静默忽略 */ }
+    if (s.mapBlocks.length > 20) s.mapBlocks = s.mapBlocks.slice(s.mapBlocks.length - 20);
+  }
+  _saveSessions(data);
 }
 
-/** 读取历史消息数组 */
-function _loadHistory() {
-  try {
-    var raw = localStorage.getItem(STORAGE_KEY_HISTORY);
-    return raw ? JSON.parse(raw) : [];
-  } catch(e) { return []; }
-}
-
-/** 把所有 assistant 消息中的地图 JSON 块累积保存（供还原地图用）*/
-function _saveMapBlocks(text) {
-  try {
-    var existing = [];
-    try { existing = JSON.parse(localStorage.getItem(STORAGE_KEY_MAP) || "[]"); } catch(_) {}
-    // 提取当前消息中的 JSON 块
-    var re = /```json\s*([\s\S]*?)```/g, m;
-    while ((m = re.exec(text)) !== null) {
-      try {
-        var obj = JSON.parse(m[1].trim());
-        if (obj.__type) existing.push(obj);
-      } catch(_) {}
-    }
-    // 只保留最近 20 个地图块
-    if (existing.length > 20) existing = existing.slice(existing.length - 20);
-    localStorage.setItem(STORAGE_KEY_MAP, JSON.stringify(existing));
-  } catch(e) {}
-}
-
-/** 清除所有持久化数据（清除对话时调用）*/
 function clearHistory() {
-  localStorage.removeItem(STORAGE_KEY_HISTORY);
-  localStorage.removeItem(STORAGE_KEY_MAP);
+  var data = _loadSessions();
+  if (data.sessions && _currentSessionId) {
+    delete data.sessions[_currentSessionId];
+    data.order = (data.order || []).filter(function (id) { return id !== _currentSessionId; });
+  }
   document.getElementById("chat-log").innerHTML = "";
   clearMapMarkers();
   document.getElementById("weather-bar").style.display = "none";
   document.getElementById("side-panel").style.display = "none";
   document.getElementById("toggle-side-btn").style.display = "none";
   sidePanelData = { itinerary: null, hotel: [], restaurant: [] };
+  window._a2uiSavedPlaces = [];
+  _currentSessionId = _newSessionId();
+  data.sessions[_currentSessionId] = _emptySession(_currentSessionId);
+  data.active = _currentSessionId;
+  (data.order || []).unshift(_currentSessionId);
+  _saveSessions(data);
+  _renderSessionList();
 }
 
-/** 页面加载时还原历史对话和地图 */
-function _restoreHistory() {
-  var history = _loadHistory();
-  if (history.length === 0) return;
+function _newSession() {
+  var data = _loadSessions();
+  _currentSessionId = _newSessionId();
+  data.sessions = data.sessions || {};
+  data.order = data.order || [];
+  data.sessions[_currentSessionId] = _emptySession(_currentSessionId);
+  data.active = _currentSessionId;
+  data.order.unshift(_currentSessionId);
+  while (data.order.length > MAX_SESSIONS) { var oldId = data.order.pop(); delete data.sessions[oldId]; }
+  _saveSessions(data);
+  document.getElementById("chat-log").innerHTML = "";
+  clearMapMarkers();
+  document.getElementById("weather-bar").style.display = "none";
+  document.getElementById("side-panel").style.display = "none";
+  document.getElementById("toggle-side-btn").style.display = "none";
+  sidePanelData = { itinerary: null, hotel: [], restaurant: [] };
+  window._a2uiSavedPlaces = [];
+  _renderSessionList();
+}
 
-  // 还原消息（_skipSave=true 避免重复写入）
-  history.forEach(function(item) {
-    appendMessage(item.role, item.text, true);
+function _switchSession(sessionId) {
+  if (sessionId === _currentSessionId) return;
+  var data = _loadSessions();
+  if (!data.sessions || !data.sessions[sessionId]) return;
+  _currentSessionId = sessionId;
+  data.active = sessionId;
+  _saveSessions(data);
+  document.getElementById("chat-log").innerHTML = "";
+  clearMapMarkers();
+  document.getElementById("weather-bar").style.display = "none";
+  document.getElementById("side-panel").style.display = "none";
+  document.getElementById("toggle-side-btn").style.display = "none";
+  sidePanelData = { itinerary: null, hotel: [], restaurant: [] };
+  window._a2uiSavedPlaces = [];
+  _restoreCurrentSession();
+  _renderSessionList();
+}
+
+function _deleteSession(sessionId) {
+  var data = _loadSessions();
+  if (data.sessions) delete data.sessions[sessionId];
+  if (data.order) data.order = data.order.filter(function (id) { return id !== sessionId; });
+  if (data.active === sessionId) {
+    if (data.order.length > 0) { data.active = data.order[0]; _currentSessionId = data.active; }
+    else {
+      _currentSessionId = _newSessionId();
+      data.sessions[_currentSessionId] = _emptySession(_currentSessionId);
+      data.active = _currentSessionId; data.order.unshift(_currentSessionId);
+    }
+    document.getElementById("chat-log").innerHTML = "";
+    clearMapMarkers();
+    document.getElementById("weather-bar").style.display = "none";
+    document.getElementById("side-panel").style.display = "none";
+    document.getElementById("toggle-side-btn").style.display = "none";
+    sidePanelData = { itinerary: null, hotel: [], restaurant: [] };
+    window._a2uiSavedPlaces = [];
+    _restoreCurrentSession();
+  }
+  _saveSessions(data);
+  _renderSessionList();
+}
+
+function _restoreCurrentSession() {
+  var data = _loadSessions();
+  var s = _currentSessionData();
+  if (!s) return;
+  (s.messages || []).forEach(function (item) { appendMessage(item.role, item.text, true); });
+  (s.mapBlocks || []).forEach(function (obj) {
+    var ft = "\n```json\n" + JSON.stringify(obj) + "\n```";
+    extractAndPlotMapData(ft);
   });
+  (s.a2uiCards || []).forEach(function (entry) {
+    var d = entry.data;
+    if (!d || !d.type || d.type === "form_response") return;
+    if (d.type === "form_card" || d.type === "place_card") _renderA2UICard(d.type, d.payload);
+  });
+}
 
-  // 地图块：直接重放最新保存的那批 JSON 块
-  try {
-    var blocks = JSON.parse(localStorage.getItem(STORAGE_KEY_MAP) || "[]");
-    blocks.forEach(function(obj) {
-      // 构造带 ```json ``` 包装的字符串，复用已有逻辑
-      var fakeText = "\n```json\n" + JSON.stringify(obj) + "\n```";
-      extractAndPlotMapData(fakeText);
-    });
-  } catch(e) {}
+function _restoreHistory() {
+  var data = _migrateOldData();
+  if (!data.order || data.order.length === 0) {
+    _currentSessionId = _newSessionId();
+    data.sessions = data.sessions || {};
+    data.order = data.order || [];
+    data.sessions[_currentSessionId] = _emptySession(_currentSessionId);
+    data.active = _currentSessionId;
+    data.order.unshift(_currentSessionId);
+    _saveSessions(data);
+  } else { _currentSessionId = data.active; }
+  _restoreCurrentSession();
+  _renderSessionList();
 }
 
 function showTyping() {
@@ -155,6 +301,187 @@ function removeTyping() {
   const el = document.getElementById("typing-indicator");
   if (el) el.remove();
 }
+
+function handleA2UIEvent(evt) {
+  if (!evt || !evt.type) return;
+
+  // ── Debug-only events (console, not chat bubbles) ────────────────────
+  if (evt.type === "memory_mode" || evt.type === "quality_feedback" || evt.type === "retry") {
+    console.log("[A2UI]", evt.type, evt);
+    return;
+  }
+
+  if (evt.type === "invoke_failed") {
+    appendMessage("assistant", "❌ 调用失败: " + (evt.error || "未知错误"));
+    return;
+  }
+  if (evt.type === "precheck_failed") {
+    appendMessage("assistant", "⚠️ " + (evt.suggestion || "信息不完整，请在下方表单中补充。"));
+    return;
+  }
+  // ── 交互式卡片 ────────────────────────────────────────────────────────
+  if (evt.type === "form_card") {
+    _renderA2UICard("form_card", evt);
+    return;
+  }
+  if (evt.type === "place_card") {
+    _renderA2UICard("place_card", evt);
+    return;
+  }
+}
+
+// ── A2UI 卡片渲染 & 持久化 ─────────────────────────────────────────────
+
+/** 将 A2UI 卡片渲染到聊天区并持久化 */
+function _renderA2UICard(cardType, payload) {
+  var log = document.getElementById("chat-log");
+  var cardEl = null;
+
+  if (typeof A2UICards !== "undefined") {
+    if (cardType === "form_card") {
+      cardEl = A2UICards.renderFormCard(payload);
+    } else if (cardType === "place_card") {
+      cardEl = A2UICards.renderPlaceCard(payload);
+    }
+  }
+
+  if (!cardEl) {
+    // 回退：纯文本展示
+    var wrap = document.createElement("div");
+    wrap.className = "chat-msg chat-msg-assistant";
+    var body = document.createElement("div");
+    body.className = "chat-msg-body";
+    body.textContent = "[A2UI " + cardType + "] " + JSON.stringify(payload).slice(0, 200);
+    wrap.appendChild(body);
+    cardEl = wrap;
+  }
+
+  log.appendChild(cardEl);
+  log.scrollTop = log.scrollHeight;
+
+  // 持久化（form_response 类型的提交不在此列）
+  _saveA2UICard({ type: cardType, payload: payload });
+}
+
+/** 持久化 A2UI 卡片到当前会话 */
+function _saveA2UICard(cardEntry) {
+  var data = _loadSessions();
+  var s = _currentSessionData();
+  if (!s) return;
+  s.a2uiCards.push({ data: cardEntry, ts: Date.now() });
+  if (s.a2uiCards.length > MAX_A2UI_CARDS) {
+    s.a2uiCards = s.a2uiCards.slice(s.a2uiCards.length - MAX_A2UI_CARDS);
+  }
+  _saveSessions(data);
+}
+
+/** 前端向 WebSocket 发送 A2UI 消息（供 a2ui-cards.js 调用）*/
+window._sendA2UIResponse = function (a2uiText) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.warn("[A2UI] WebSocket not open, cannot send response");
+    return;
+  }
+  ws.send(a2uiText);
+};
+
+// ── 会话列表渲染 ───────────────────────────────────────────────────────────
+
+function _formatRelativeTime(ts) {
+  var delta = (Date.now() - ts) / 1000;
+  if (delta < 60) return "刚刚";
+  if (delta < 3600) return Math.floor(delta / 60) + "分钟前";
+  if (delta < 86400) return Math.floor(delta / 3600) + "小时前";
+  if (delta < 172800) return "昨天";
+  if (delta < 604800) return Math.floor(delta / 86400) + "天前";
+  var d = new Date(ts);
+  return (d.getMonth() + 1) + "/" + d.getDate();
+}
+
+function _renderSessionList() {
+  var data = _loadSessions();
+  var listEl = document.getElementById("session-list");
+  if (!listEl) return;
+  listEl.innerHTML = "";
+  var order = data.order || [];
+  if (order.length === 0) {
+    listEl.innerHTML = '<div class="session-empty">' +
+      '<div class="session-empty-icon">💬</div>' +
+      '<div class="session-empty-text">暂无历史会话</div>' +
+      '<div class="session-empty-sub">开始一段新的旅行规划吧</div>' +
+      '</div>';
+    return;
+  }
+  order.forEach(function (sid) {
+    var s = (data.sessions || {})[sid];
+    if (!s) return;
+    var isActive = sid === _currentSessionId;
+    var msgCount = (s.messages || []).length;
+
+    var item = document.createElement("div");
+    item.className = "session-item" + (isActive ? " active" : "");
+    item.onclick = function () { _switchSession(sid); _closeSessionDropdown(); };
+
+    // 左侧：选中指示点
+    var dot = document.createElement("span");
+    dot.className = "session-item-dot";
+
+    // 中间：标题 + 消息数
+    var body = document.createElement("div");
+    body.className = "session-item-body";
+    var title = document.createElement("div");
+    title.className = "session-item-title";
+    title.textContent = s.title || "新对话";
+    var meta = document.createElement("div");
+    meta.className = "session-item-meta";
+    meta.textContent = _formatRelativeTime(s.updatedAt || s.createdAt) +
+      (msgCount ? " · " + msgCount + " 条消息" : "");
+
+    body.appendChild(title);
+    body.appendChild(meta);
+
+    // 右侧：删除按钮
+    var delBtn = document.createElement("button");
+    delBtn.className = "session-item-del";
+    delBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+    delBtn.title = "删除会话";
+    delBtn.onclick = function (e) {
+      e.stopPropagation();
+      if (confirm("确定删除「" + (s.title || "新对话") + "」吗？")) _deleteSession(sid);
+    };
+
+    item.appendChild(dot);
+    item.appendChild(body);
+    item.appendChild(delBtn);
+    listEl.appendChild(item);
+  });
+}
+
+/** 切换会话下拉面板的显示/隐藏 */
+function _toggleSessionDropdown() {
+  var dd = document.getElementById("session-dropdown");
+  if (!dd) return;
+  if (dd.style.display === "none") {
+    _renderSessionList();
+    dd.style.display = "flex";
+  } else {
+    dd.style.display = "none";
+  }
+}
+
+function _closeSessionDropdown() {
+  var dd = document.getElementById("session-dropdown");
+  if (dd) dd.style.display = "none";
+}
+
+// 点击下拉面板外部时关闭
+document.addEventListener("click", function (e) {
+  var dd = document.getElementById("session-dropdown");
+  var btn = document.getElementById("btn-sessions");
+  if (!dd || dd.style.display === "none") return;
+  if (!dd.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+    dd.style.display = "none";
+  }
+});
 
 // ── WebSocket ─────────────────────────────────────────────────────────────
 function initWebSocket() {
@@ -175,8 +502,16 @@ function initWebSocket() {
   };
 
   ws.onmessage = (event) => {
+    const text = event.data || "";
+    if (text.startsWith(A2UI_PREFIX)) {
+      try {
+        const payload = JSON.parse(text.slice(A2UI_PREFIX.length));
+        handleA2UIEvent(payload);
+      } catch (_) {}
+      return;
+    }
     removeTyping();
-    appendMessage("assistant", event.data);
+    appendMessage("assistant", text);
   };
 
   ws.onerror = (err) => {

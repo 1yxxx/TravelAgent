@@ -41,3 +41,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# 截图 / 隐私相关
+pic/
+interview/

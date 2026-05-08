@@ -1,6 +1,6 @@
 # 🗺️ Travel Agent — AI 旅行规划助手
 
-基于 **LangGraph ReAct** 架构的多工具旅行规划 Agent，集成高德地图 API，支持自然语言对话式行程规划、POI 搜索、路线规划、天气查询、预算估算，并在前端实时渲染交互地图。新增**三层压缩记忆系统**，实现消息滑动窗口压缩、工具结果上下文注入与跨会话用户偏好持久化。
+基于 **LangGraph ReAct** 架构的多工具旅行规划 Agent，集成高德地图 API，支持自然语言对话式行程规划、POI 搜索、路线规划、天气查询、预算估算，并在前端实时渲染交互地图。
 
 > 本项目的整体架构（Agent 编排、工具节点体系、配置中心、Skills 扩展机制等）基于 [FireRed-OpenStoryline](https://github.com/FireRedTeam/FireRed-OpenStoryline) 开源框架搭建，并在此基础上针对旅行场景进行了定制开发。
 
@@ -25,24 +25,29 @@
 | 💬 **对话历史** | localStorage 持久化聊天记录 |
 | 🔌 **MCP 服务** | 将 Agent 工具通过 MCP 协议暴露，可供外部 LLM 客户端调用 |
 | 🧩 **Skills 扩展** | Markdown 格式的可插拔 Skill，无需改代码即可扩展 Agent 能力 |
-| 🧠 **三层压缩记忆** | L1 消息滑动窗口+LLM摘要压缩 / L2 工具结果 snapshot 注入 / L3 跨 session 用户偏好持久化 |
+| 🧠 **会话记忆** | 多轮对话跨会话记忆，工具调用结果持久化到 artifacts |
 
 ---
 
 ## 📸 效果展示
 
 <p align="center">
-  <img src="pic/screenshot_1.png" width="80%" alt="对话界面与地图渲染" />
+  <img src="docs/screenshots/a2ui.png" width="80%" alt="A2UI 对话中展示组件" />
+  <br><em>对话框中展示 A2UI 交互组件（表单卡片 / 地点卡片）</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/screenshot_1.png" width="80%" alt="对话界面与地图渲染" />
   <br><em>对话界面与高德地图实时渲染</em>
 </p>
 
 <p align="center">
-  <img src="pic/screenshot_2.png" width="80%" alt="行程规划结果" />
+  <img src="docs/screenshots/screenshot_2.png" width="80%" alt="行程规划结果" />
   <br><em>餐厅展示</em>
 </p>
 
 <p align="center">
-  <img src="pic/screenshot_3.png" width="80%" alt="路线规划与 POI 标记" />
+  <img src="docs/screenshots/screenshot_3.png" width="80%" alt="路线规划与 POI 标记" />
   <br><em>住宿展示</em>
 </p>
 
@@ -86,7 +91,7 @@
 
 ```
 travel/
-├── agent_fastapi.py              # FastAPI 服务入口（含 WebSocket 推送 + 三层记忆调度）
+├── agent_fastapi.py              # FastAPI 服务入口（含 SSE 流式推送）
 ├── cli.py                        # 命令行交互入口
 ├── build_env.sh                  # 一键创建 uv 虚拟环境脚本
 ├── config.toml                   # ⚠️ 含 API Key，已加入 .gitignore，请勿提交
@@ -119,7 +124,7 @@ travel/
 │
 ├── src/
 │   └── travel_agent/
-│       ├── agent.py              # Agent 构建 & 工具注册 & ClientContext（含三层记忆）
+│       ├── agent.py              # Agent 构建 & 工具注册
 │       ├── config.py             # Pydantic 配置加载
 │       ├── mcp/                  # MCP 服务层（将工具暴露给外部客户端）
 │       │   ├── server.py         # MCP Server 启动入口
@@ -145,9 +150,7 @@ travel/
 │       ├── skills/
 │       │   └── skills_io.py      # Skills 加载 & 热插拔逻辑
 │       ├── storage/
-│       │   ├── agent_memory.py   # L2：工具结果持久化 + context_snapshot 注入
-│       │   ├── memory_compressor.py  # L1：消息滑动窗口 + LLM 摘要压缩
-│       │   ├── user_profile.py   # L3：跨 session 用户偏好 / 历史摘要持久化
+│       │   ├── agent_memory.py   # 多轮对话记忆管理
 │       │   └── session_manager.py# 会话隔离 & 生命周期
 │       └── utils/
 │           ├── prompts.py        # Prompt 加载工具
@@ -260,104 +263,191 @@ builder.render(task="format_itinerary", role="system", lang="zh", days=3, city="
 
 ---
 
-### 三层压缩记忆系统
+## 🧱 分层编排（首期实现）
 
-项目实现了完整的**三层压缩记忆架构**，解决了长对话 token 膨胀、工具数据重复查询、跨会话用户偏好遗忘三大问题：
+项目已支持固定 5 层编排（可开关）：
 
-```
-每轮对话
-    │
-    ▼
-┌──────────────────────────────────────────────┐
-│ L1  MemoryCompressor（memory_compressor.py） │
-│  ─ 检查 messages 是否超出阈值                 │
-│    （默认 40 条 或 6000 token 估算）          │
-│  ─ 超出时调用 LLM 将早期消息压缩为一条摘要     │
-│    SystemMessage，替换进 messages 头部        │
-│  ─ LLM 失败时降级为截断策略（保留最近 10 条） │
-│  ─ 摘要持久化到 <session_dir>/summary.json   │
-└─────────────────────┬────────────────────────┘
-                      │ 压缩后的纯对话历史
-                      ▼
-┌──────────────────────────────────────────────┐
-│ L2  ArtifactStore.build_context_prompt()     │
-│    （agent_memory.py）                        │
-│  ─ 读取本 session 所有工具执行结果快照         │
-│  ─ 排除纯渲染类工具（render_map 等）          │
-│  ─ 每条 payload 截断至 600 字符              │
-│  ─ 格式化为 Markdown，注入动态 system prompt  │
-└─────────────────────┬────────────────────────┘
-                      │ 含工具数据的 system prompt
-                      ▼
-┌──────────────────────────────────────────────┐
-│ L3  UserProfileStore（user_profile.py）      │
-│  ─ 跨 session 持久化用户偏好                  │
-│    （城市 / 预算 / 节奏 / 人数 / 菜系偏好）   │
-│  ─ 每轮结束后规则提取 HumanMessage 中的偏好   │
-│  ─ session 断开时将 L1 摘要归档进用户历史     │
-│  ─ 新 session 将偏好 + 近 2 条历史注入        │
-│    system prompt 头部                         │
-│  ─ 存储于 <data_dir>/user_profiles/          │
-└──────────────────────────────────────────────┘
+1. requirement（需求拆解）
+2. research（检索调研）
+3. planning（行程编排）
+4. risk（风险校验）
+5. render（结果渲染）
+
+每层仅暴露该层工具，层校验失败时会回滚到最近成功 checkpoint 并重试。
+
+在 `config.toml` 中配置：
+
+```toml
+[orchestration]
+enabled = true
+max_retries_per_layer = 1
+strict_validation = false
 ```
 
-**关键设计**：`messages`（纯对话历史）与发给 `ainvoke` 的 `_invoke_input`（含动态 system prompt 的副本）严格分离，每轮从 `raw_messages` 回收时过滤动态 SystemMessage，避免动态 prompt 污染历史记录、导致 L1 摘要无限叠加。
+- `enabled`: 是否启用分层编排（关闭时回退为原始 ReAct 全量工具模式）
+- `max_retries_per_layer`: 单层失败后的最大重试次数
+- `strict_validation`: 是否对 risk/render 层启用“必须调用工具”的严格校验
 
-#### L1 可调参数（`build_agent` 中修改）
+启用后，每轮响应会把分层指标作为 `layer_metrics` artifact 写入会话目录（`travel_outputs/<session_id>/layer_metrics/*.json`），可用于离线评估。
 
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `max_messages` | `40` | 消息条数超出阈值时触发压缩 |
-| `keep_recent` | `10` | 压缩时保留最近 N 条不参与摘要 |
-| `max_tokens_estimate` | `6000` | token 估算值超出时也触发压缩 |
+可使用评估脚本聚合会话级指标：
 
-#### L2：工具结果持久化（ArtifactStore）
-
-每次工具调用结束后，结果自动写入 `artifacts/` 目录，供下一轮对话直接引用：
-
-```
-artifacts/
-└── <session_id>/
-    ├── meta.json              # 本会话所有 artifact 的索引
-    ├── search_poi/
-    │   └── search_poi_<hash>.json
-    ├── check_weather/
-    │   └── check_weather_<hash>.json
-    └── search_hotel/
-        └── search_hotel_<hash>.json
+```bash
+python scripts/eval_layer_metrics.py --outputs-dir travel_outputs --out-dir travel_outputs/eval
 ```
 
-`build_context_prompt()` 读取每个节点的最新结果，格式化后注入 system prompt，让 LLM 在后续轮次直接感知已收集的数据，无需重复调用 API。
+脚本会输出：
 
-#### L3：跨 session 用户画像
+- 会话数量、平均/中位/P90 命中率
+- 平均/中位/P90 回滚率
+- 全局回滚率（总回滚次数 / 总尝试次数）
+- Top 失败层统计
+
+### 近期完成项（2026-04-19）
+
+已完成并落地到主流程：
+
+- 分层编排引擎：新增 5 层顺序执行、按层工具白名单、失败回滚至最近通过 checkpoint 后重试。
+- 指标计算：新增层命中率（layer_hit_rate）、回滚率（rollback_rate）、按层尝试次数与成功状态统计。
+- 指标持久化：在 WebSocket 服务与 CLI 两条入口链路中，成功响应后将 `layer_metrics` 写入会话 artifacts。
+- 离线评估：新增 `scripts/eval_layer_metrics.py`，可跨 session 聚合命中率/回滚率，并导出 JSON 与 CSV。
+- 测试覆盖：新增分层编排与评估聚合测试，覆盖回滚触发、指标计算、空 session 忽略等关键路径。
+
+验证状态：
+
+- 单测通过：`tests/test_layered_orchestration.py` + `tests/test_eval_layer_metrics.py`。
+- 评估脚本可正常执行并产出文件；若历史会话尚未写入 `layer_metrics`，聚合结果会显示 session_count 为 0（属预期）。
+
+建议执行顺序：
+
+1. 先运行若干新会话（CLI 或 Web）产出 `layer_metrics` artifacts。
+2. 再运行评估脚本，获得首批可分析的命中率与回滚率基线。
+
+### 近期完成项（2026-04-20）
+
+在 2026-04-19 的基础上，项目继续完成了第一阶段核心泛化能力的工程落地：
+
+- 工具场景标签化与动态过滤：新增场景标签识别（亲子/老年/情侣/独行、预算、短途/长线等），在分层编排执行前按场景裁剪工具集合。
+- 运行时工具选择：分层编排器支持 runtime tool selector，按当前用户需求实时选择 research/planning/risk/render 层可见工具。
+- 三套记忆框架动态切换：在 full_context / compressed_context / profile_only 间按消息规模与 token 估算自动切换。
+- A2UI 事件通道增强：新增 memory_mode、retry、invoke_failed、quality_feedback 事件并接入前端消费。
+- 前置业务校验：在调用 Agent 前新增意图/目的地/天数校验，不满足条件时直接返回引导信息并发出 precheck_failed 事件。
+- 分层业务校验增强：对特殊场景（如亲子/老年/长线）增加 research 与 planning 的业务约束校验（天气、交通路径等）。
+
+对应测试已补齐并通过：
+
+- `tests/test_tool_scenario_filter.py`
+- `tests/test_precheck.py`
+- `tests/test_memory_framework.py`
+- `tests/test_layered_orchestration.py`
+- `tests/test_eval_layer_metrics.py`
+
+阶段性回归结果：17 passed。
+
+### 近期修复（2026-05-08）
+
+本轮针对线上运行中发现的三个严重问题进行了修复和优化：
+
+#### 1. DeepSeek Thinking 模式兼容性修复
+
+**问题**：DeepSeek 部分账户（或推理模型如 `deepseek-reasoner`）默认启用 thinking 模式。API 响应中的 `AIMessage` 会携带 `reasoning_content` 字段（模型的内部推理过程），且协议**强制要求**在后续请求中将该字段原样回传。但 LangChain 在 `_convert_message_to_dict()` 中将消息序列化为 API 请求格式时，只包含 `content`、`role`、`tool_calls` 三个字段，直接**丢弃了 `reasoning_content`**，导致 API 返回 400 错误。
+
+**影响**：在 thinking 模式下，**每次 API 调用都会失败**（400: `The reasoning_content in the thinking mode must be passed back to the API`），分层编排的重试机制会让失败重复发生，用户看到的是超时或空响应。
+
+**修复位置**：
+- `src/travel_agent/agent.py:132-144` — `DeepSeekChatOpenAI._get_request_payload()` 在父类序列化后，从原始消息中提取 `reasoning_content` 并回注到对应的 assistant 消息体中
+- `agent_fastapi.py:64-76` — `_clean_messages_for_next_turn()` 在重建 `AIMessage` 对象时保留 `reasoning_content`
+
+**规避方案**：如使用非 thinking 模型（标准 `deepseek-chat` 且不传 `reasoning_effort` 参数），此问题不会触发。但本项目的修复已确保两种模式都能正常工作。
+
+#### 2. 分层编排依赖死锁
+
+**问题**：5 层顺序编排（requirement → research → planning → risk → render）在每层仅暴露该层工具，且**前层校验不通过就无法进入后层**。当 research 层的 API 调用因网络波动返回空数据、或 validator 判定工具调用不满足业务条件时，重试循环会将消息回滚到上一个 checkpoint 并重复尝试，但**回滚后的消息状态与重试前的状态完全相同**——LLM 会做出相同的决策并再次失败，形成死锁。
+
+**修复**：将 `config.toml` 中 `[orchestration].enabled` 设为 `false`，回退到标准 ReAct Agent 模式。此时所有 15 个工具对 LLM 同时可见，LLM 根据系统提示词中的 7 步调用顺序自行编排，遇到单个工具失败时可跳过或替换，不会整层卡死。
+
+> 分层编排的代码保留在 `src/travel_agent/orchestration/` 中。如需重新启用，建议先解决 checkpoint 回滚的"状态等价性问题"（即回滚后需注入不同的提示引导 LLM 改变决策路径）。
+
+#### 3. ReAct 循环无上限导致卡死
+
+**问题**：`agent_fastapi.py` 调用 `agent.ainvoke()` 时**未传入 `config` 参数**，LangGraph 使用默认递归限制（25 步）。在 LLM 出错、工具返回异常数据等边界情况下，Agent 可能陷入反复调用工具的循环，消耗完 25 步后才停止，期间用户等待长达 120 秒超时。
+
+**修复**：
+- `agent_fastapi.py:89` — 新增 `AGENT_RECURSION_LIMIT = 20`，在 `ainvoke` 时显式传入 `config={"recursion_limit": 20}`
+- `cli.py:61` — 修复原有 config 中的**拼写错误**（`" configurable"` → `"configurable"`，多余空格导致整个 config 不生效），同时加入 `recursion_limit`
+- 将 `MAX_RETRIES` 从 2 降为 1，避免用户等待过久
+
+#### 4. 会话持久化重构
+
+- 将单 key 模式（`travel_chat_history` / `travel_map_state` / `travel_a2ui_cards` 各存所有会话数据）改为**会话级存储**（`travel_sessions_v2`，按 session ID 隔离），清除对话后数据彻底删除
+- 新增**会话列表 UI**（点击「☰ 会话」按钮弹出下拉面板）：创建/切换/删除会话，支持旧数据自动迁移，相对时间显示，活跃状态指示
+
+#### 5. A2UI 双向卡片协议
+
+- 新增 `request_travel_info` MCP 工具：LLM 自主判断信息完整性，按需调用以弹出表单卡片；替代了原来基于正则的硬编码前置校验
+- 新增 `form_card` / `place_card` 类型：前者收集缺失的出行信息，后者展示 POI/酒店/餐厅详情卡片
+- `a2ui-cards.js` 修复：`window.ws` → 词法作用域 `ws`（`let` 声明不挂载到 `window`）
+- 状态消息（`memory_mode`、`quality_feedback`）移至 `console.log`，不污染对话界面
+
+### 详细技术文档
+
+本轮完整实现说明（架构、模块、配置、事件流、测试与后续路线）见：
+
+- `docs/harness_generalization_implementation.md`
+
+---
+
+### 记忆功能实现
+
+项目实现了两层记忆：
+
+#### 层 1：对话上下文记忆（LangGraph 消息历史）
+
+LangGraph ReAct agent 维护完整的 `messages` 列表，包含每轮的 `HumanMessage`、`AIMessage`、`ToolMessage`。`agent_fastapi.py` 在每次请求时将历史消息传入，LLM 可感知整个对话上下文：
+
+```python
+# agent_fastapi.py
+_clean_messages_for_next_turn(messages)   # 将 list/dict content 序列化为 string
+                                           # （DeepSeek API 要求 content 必须是 string）
+await agent.ainvoke({"messages": messages})
+```
+
+#### 层 2：工具结果持久化（ArtifactStore）
+
+每次工具调用结束后，结果写入本地文件，形成跨请求的持久记忆：
 
 ```
-<data_dir>/user_profiles/default.json
-
-{
-  "preferred_cities": ["成都", "重庆"],
-  "budget_level": "mid",
-  "travel_pace": "relaxed",
-  "group_size": 2,
-  "cuisine_preferences": ["川菜", "火锅"],
-  "session_summaries": [
-    { "session_id": "...", "summary": "用户规划了成都3天行程...", "created_at": ... }
-  ]
-}
+调用 search_poi("成都", "武侯祠")
+        │
+        ▼
+ArtifactStore.save_result(
+    node_id    = "search_poi",
+    payload    = { POI 列表 },
+    summary    = "POI 搜索: 武侯祠 @ 成都",
+)
+        │
+        ▼
+artifacts/<session_id>/search_poi/search_poi_3588b6d6.json
+artifacts/<session_id>/meta.json  ← 追加索引记录
 ```
+
+`context_snapshot()` 方法可将当前会话所有工具的最新结果打包为一个字典，注入到 LLM 提示词或 MCP 响应中，使 LLM 在后续轮次中感知已有数据而无需重复 API 调用。
 
 #### 会话隔离与清理（SessionLifecycleManager）
 
 ```python
 mgr = SessionLifecycleManager(
     artifacts_root = "travel_outputs/",
-    cache_root     = ".travel/.server_cache/",
+    cache_root     = ".storyline/.server_cache/",
     retention_days = 3,      # 3 天后自动清理
     max_sessions   = 256,    # 最多保留 256 个会话
 )
+
+store = mgr.get_store(session_id)    # 取或创建当前会话的 ArtifactStore
+mgr.cleanup_expired()                # 删除过期目录（超时 or 超数量）
 ```
 
-每个 WebSocket 连接对应独立 `session_id`，不同用户数据完全隔离。
+每个 WebSocket 连接对应独立 `session_id`，不同用户的 artifacts 目录完全隔离。
 
 ---
 
@@ -641,59 +731,30 @@ uv run python scripts/test_memory.py
 
 ## 🧠 Memory & Storage
 
-Agent 实现了**三层压缩记忆系统**，完整覆盖短期压缩、中期工具感知和长期偏好持久化三个维度。
+Agent 具备**跨多轮对话的工具结果记忆**能力，所有工具调用结果以 JSON 文件持久化到本地，避免重复调用 API。
 
-### L1：消息滑动窗口压缩（MemoryCompressor）
+### ArtifactStore — 工具结果持久化
 
-`src/travel_agent/storage/memory_compressor.py`
-
-长对话时，messages 列表超出阈值后自动调用 LLM 生成摘要，将早期对话压缩为一条 SystemMessage 保留在上下文头部，近期消息完整保留：
-
-```
-压缩前：[SysMsg] [Human] [AI] [Tool] × N 轮 ...（超出 40 条）
-                              ↓ LLM 摘要
-压缩后：[SysMsg] [摘要SysMsg] [最近 10 条消息]
-```
-
-摘要同步持久化到 `<session_dir>/summary.json`，LLM 故障时自动降级为截断策略。
-
-### L2：工具结果 Snapshot 注入（ArtifactStore）
-
-`src/travel_agent/storage/agent_memory.py`
-
-每次工具调用后，结果写入本地 JSON 文件。新增 `build_context_prompt()` 方法，在每轮对话开始前读取本 session 所有工具的最新结果，格式化后注入动态 system prompt：
+每次工具调用结束后，结果自动写入 `artifacts/` 目录：
 
 ```
 artifacts/
 └── <session_id>/
-    ├── meta.json
-    ├── search_poi/search_poi_<hash>.json
-    ├── check_weather/check_weather_<hash>.json
-    └── search_hotel/search_hotel_<hash>.json
+    ├── meta.json              # 本会话所有 artifact 的索引（node_id / 摘要 / 时间戳）
+    ├── search_poi/
+    │   └── search_poi_<hash>.json
+    ├── check_weather/
+    │   └── check_weather_<hash>.json
+    └── search_hotel/
+        └── search_hotel_<hash>.json
 ```
 
-LLM 在每轮开始时即可感知"本次已查过成都天气、已搜过 8 个景点"，无需重复调用 API。
-
-### L3：跨 Session 用户偏好（UserProfileStore）
-
-`src/travel_agent/storage/user_profile.py`
-
-自动从对话中提取用户偏好（城市、预算、节奏、人数、菜系等），持久化到本地 JSON，每次新 session 开始时自动注入 system prompt：
-
-```json
-{
-  "preferred_cities": ["成都", "重庆"],
-  "budget_level": "mid",
-  "travel_pace": "relaxed",
-  "group_size": 2,
-  "cuisine_preferences": ["川菜", "火锅"],
-  "session_summaries": [...]
-}
-```
+- 同一会话内，Agent 可直接从 `ArtifactStore` 读取已有结果，**无需重复调用高德 API**
+- `meta.json` 记录每条结果的 `node_id`、`summary`、`created_at`，便于快速检索
 
 ### SessionLifecycleManager — 会话生命周期
 
-`src/travel_agent/storage/session_manager.py`
+`SessionLifecycleManager` 统一管理多用户并发场景下的会话隔离：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|

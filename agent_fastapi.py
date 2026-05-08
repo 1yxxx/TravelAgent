@@ -13,7 +13,7 @@ import json
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
@@ -23,6 +23,7 @@ if SRC_DIR not in sys.path:
 from travel_agent.agent import build_agent  # noqa: E402
 from travel_agent.config import load_settings  # noqa: E402
 from travel_agent.utils.logging import logger  # noqa: E402
+from travel_agent.a2ui_cards import extract_place_cards  # noqa: E402
 
 # 永远使用本文件所在目录（travel/）下的 config.toml，与启动目录无关
 CONFIG_PATH = os.path.join(ROOT_DIR, "config.toml")
@@ -50,10 +51,13 @@ def _clean_messages_for_next_turn(messages: list) -> list:
     保留完整消息历史（Human / AI / Tool），仅将 content 中的 list/dict
     序列化为字符串，避免 DeepSeek 400 错误，同时不破坏上下文记忆。
     """
-    from langchain_core.messages import AIMessage as _AI, ToolMessage as _Tool, HumanMessage as _Human
+    from langchain_core.messages import AIMessage as _AI, ToolMessage as _Tool, HumanMessage as _Human, SystemMessage as _System
 
     cleaned = []
     for m in messages:
+        if isinstance(m, _System):
+            # 动态 system prompt 每轮重建，不写回历史，避免重复膨胀。
+            continue
         content = _normalize_content(getattr(m, "content", "") or "")
         if isinstance(m, _Human):
             cleaned.append(_Human(content=content))
@@ -64,6 +68,10 @@ def _clean_messages_for_next_turn(messages: list) -> list:
                 extra["tool_calls"] = m.tool_calls
             if getattr(m, "additional_kwargs", None):
                 extra["additional_kwargs"] = m.additional_kwargs
+            # DeepSeek thinking 模式要求 reasoning_content 必须回传
+            reasoning = getattr(m, "reasoning_content", None)
+            if reasoning:
+                extra["reasoning_content"] = reasoning
             cleaned.append(_AI(content=content, **extra))
         elif isinstance(m, _Tool):
             cleaned.append(_Tool(content=content, tool_call_id=m.tool_call_id))
@@ -78,7 +86,18 @@ INDEX_HTML = os.path.join(WEB_DIR, "index.html")
 
 # 超时配置（秒）
 AGENT_TIMEOUT = 120
-MAX_RETRIES = 2
+MAX_RETRIES = 1            # 失败后最多重试 1 次（共 2 次尝试），避免用户等待过久
+AGENT_RECURSION_LIMIT = 20 # ReAct 循环步数上限，防止 LLM 无限循环导致卡死
+
+
+def _build_a2ui_line(prefix: str, payload: Dict[str, Any]) -> str:
+    return prefix + json.dumps(payload, ensure_ascii=False)
+
+
+async def _send_a2ui_if_enabled(ws: WebSocket, cfg, payload: Dict[str, Any]) -> None:
+    if not getattr(cfg, "a2ui", None) or not cfg.a2ui.enabled:
+        return
+    await ws.send_text(_build_a2ui_line(cfg.a2ui.event_prefix, payload))
 
 
 def _extract_weather_block(messages: list) -> Optional[str]:
@@ -148,7 +167,7 @@ _TOOL_TYPE_MAP: dict[str, str] = {
 }
 
 
-def _extract_map_blocks(messages: list) -> str:
+def _extract_map_blocks(messages: list, call_id_to_name: dict[str, str] | None = None) -> str:
     """
     自动扫描本轮所有 ToolMessage，从工具输出中提取地图数据，
     生成前端可解析的 ```json 块。
@@ -158,16 +177,17 @@ def _extract_map_blocks(messages: list) -> str:
     - 若两者均未调用（简单搜索场景），才把 search_* 结果展示为候选 pois
     - 绝不把多套备选方案的搜索结果合并成一个行程（防止"三天/四天/五天"混用）
     """
-    # 建立 tool_call_id → tool_name 索引
-    call_id_to_name: dict[str, str] = {}
-    for m in messages:
-        if not isinstance(m, AIMessage):
-            continue
-        for tc in getattr(m, "tool_calls", []) or []:
-            cid = tc.get("id") or ""
-            name = tc.get("name") or ""
-            if cid and name:
-                call_id_to_name[cid] = name
+    # 建立 tool_call_id → tool_name 索引（可由调用方预先构建并传入）
+    if call_id_to_name is None:
+        call_id_to_name = {}
+        for m in messages:
+            if not isinstance(m, AIMessage):
+                continue
+            for tc in getattr(m, "tool_calls", []) or []:
+                cid = tc.get("id") or ""
+                name = tc.get("name") or ""
+                if cid and name:
+                    call_id_to_name[cid] = name
 
     blocks: list[str] = []
     has_itinerary_block: bool = False   # 是否已有结构化行程块
@@ -441,6 +461,7 @@ async def _run_mcp_server(cfg) -> None:
         host=cfg.mcp_server.connect_host,
         port=cfg.mcp_server.port,
         log_level="warning",
+        timeout_keep_alive=300,   # SSE 长连接保活：避免 Agent 等待 LLM 期间连接被关闭
     )
     server = uvicorn.Server(uv_cfg)
     logger.info(
@@ -521,17 +542,7 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close()
         return
 
-    # ── 三层记忆：获取 L2 ArtifactStore（从 MCP Server 的 SessionLifecycleManager 取）──
-    # 注：L2 store 通过 MCP Server lifespan context 管理，此处为 Agent 侧的镜像实例，
-    #     用于动态拼装 system prompt。
-    from travel_agent.storage.agent_memory import ArtifactStore
-    from pathlib import Path as _Path
-    _l2_store = ArtifactStore(
-        artifacts_dir=_Path(cfg.project.outputs_dir),
-        session_id=session_id,
-    )
-
-    messages: list = []   # 纯对话历史（Human / AI / Tool），不含动态 system prompt
+    messages = []
 
     try:
         while True:
@@ -542,27 +553,47 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.close()
                 break
 
+            # ── 处理前端发来的 A2UI 消息（表单提交等）────────────────────────
+            if data.startswith(cfg.a2ui.event_prefix):
+                try:
+                    a2ui_payload = json.loads(data[len(cfg.a2ui.event_prefix):])
+                except json.JSONDecodeError:
+                    continue
+                if a2ui_payload.get("type") == "form_response":
+                    fd = a2ui_payload.get("data") or {}
+                    parts = []
+                    if fd.get("destination"):
+                        parts.append(f"目的地：{fd['destination']}")
+                    if fd.get("days"):
+                        parts.append(f"天数：{fd['days']}天")
+                    if fd.get("budget"):
+                        budget_labels = {"budget": "经济实惠", "mid": "舒适享受", "luxury": "豪华体验"}
+                        parts.append(f"预算：{budget_labels.get(fd['budget'], fd['budget'])}")
+                    if fd.get("preference"):
+                        parts.append(f"偏好：{fd['preference']}")
+                    if parts:
+                        data = "，".join(parts) + "。请帮我规划旅行。"
+                        logger.info("[A2UI] form_response synthesized: %s", data)
+                    else:
+                        continue
+                else:
+                    continue
+
             messages.append(HumanMessage(content=data))
 
-            # ── L1：对纯对话历史做消息压缩（超出阈值时自动摘要） ───────────────
-            # messages 里不含动态 system prompt，L1 压缩结果干净可复用
-            if context.memory_compressor is not None:
-                try:
-                    messages = await context.memory_compressor.maybe_compress(messages)
-                except Exception as _ce:
-                    logger.warning("[L1 compress] 压缩失败（非致命）: %s", _ce)
-
-            # ── L2/L3：动态拼装含记忆的 system prompt ─────────────────────────
-            # 每轮重新读取 L2 snapshot（磁盘文件，包含上一轮工具结果）
-            dynamic_prompt = context.build_dynamic_system_prompt(store=_l2_store)
-
-            # 将动态 system prompt 作为第一条消息前置，构造送给 ainvoke 的副本
-            # 注意：这个副本只用于本轮 ainvoke，不写回 messages
-            from langchain_core.messages import SystemMessage as _SysMsg
-            if dynamic_prompt:
-                _invoke_input = [_SysMsg(content=dynamic_prompt)] + messages
-            else:
-                _invoke_input = messages
+            # ── 记忆框架动态切换（L1/L2/L3）──────────────────────────────────
+            invoke_messages, memory_meta = await context.prepare_messages_for_invoke(messages)
+            await _send_a2ui_if_enabled(
+                ws,
+                cfg,
+                {
+                    "type": "memory_mode",
+                    "mode": memory_meta.get("mode"),
+                    "reason": memory_meta.get("reason"),
+                    "message_count": memory_meta.get("message_count"),
+                    "token_estimate": memory_meta.get("token_estimate"),
+                },
+            )
 
             # ── 超时 + 重试 ────────────────────────────────────────────────────
             result: Optional[Dict[str, Any]] = None
@@ -571,7 +602,10 @@ async def websocket_endpoint(ws: WebSocket):
             for attempt in range(1, MAX_RETRIES + 2):  # 最多尝试 MAX_RETRIES+1 次
                 try:
                     result = await asyncio.wait_for(
-                        agent.ainvoke({"messages": _invoke_input}),
+                        agent.ainvoke(
+                            {"messages": invoke_messages},
+                            config={"recursion_limit": AGENT_RECURSION_LIMIT},
+                        ),
                         timeout=AGENT_TIMEOUT,
                     )
                     last_exc = None
@@ -584,6 +618,11 @@ async def websocket_endpoint(ws: WebSocket):
                         "[session=%s] Agent 超时，第 %d 次尝试", session_id, attempt
                     )
                     if attempt <= MAX_RETRIES:
+                        await _send_a2ui_if_enabled(
+                            ws,
+                            cfg,
+                            {"type": "retry", "attempt": attempt, "reason": "timeout"},
+                        )
                         await ws.send_text(
                             f"❗ 请求超时，正在进行第 {attempt} 次重试…"
                         )
@@ -596,6 +635,11 @@ async def websocket_endpoint(ws: WebSocket):
                         exc,
                     )
                     if attempt <= MAX_RETRIES:
+                        await _send_a2ui_if_enabled(
+                            ws,
+                            cfg,
+                            {"type": "retry", "attempt": attempt, "reason": str(exc)},
+                        )
                         await ws.send_text(
                             f"❗ 发生错误，正在进行第 {attempt} 次重试…"
                         )
@@ -605,12 +649,80 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_text(
                     f"❌ 抱歉，尝试 {MAX_RETRIES + 1} 次后仍无法完成请求。\n原因：{err_msg}"
                 )
+                await _send_a2ui_if_enabled(
+                    ws,
+                    cfg,
+                    {"type": "invoke_failed", "error": err_msg},
+                )
                 # 移除未得到回复的 Human 消息，避免下轮展开历史混乱
                 messages = messages[:-1]
                 continue
 
+            try:
+                metric_artifact_id = context.persist_layer_metrics(result)
+                if metric_artifact_id:
+                    logger.info("[session=%s] persisted layer metrics: %s", session_id, metric_artifact_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[session=%s] failed to persist layer metrics: %s", session_id, exc)
+
+            feedback = context.build_quality_feedback(result)
+            if feedback.get("enabled"):
+                await _send_a2ui_if_enabled(
+                    ws,
+                    cfg,
+                    {
+                        "type": "quality_feedback",
+                        "status": feedback.get("status"),
+                        "failure_count": feedback.get("failure_count", 0),
+                        "failures": feedback.get("failures", []),
+                    },
+                )
+
             # ── 提取最终回复文本 ──────────────────────────────────────────────
             raw_messages = result["messages"]
+
+            # ── 检测 LLM 是否调用了 request_travel_info（需要用户补充信息）────
+            _request_info_form = None
+            for m in raw_messages:
+                if not isinstance(m, ToolMessage):
+                    continue
+                # 从 AIMessage tool_calls 中检查工具名
+                _tcid = getattr(m, "tool_call_id", "") or ""
+                for am in raw_messages:
+                    if not isinstance(am, AIMessage):
+                        continue
+                    for tc in getattr(am, "tool_calls", []) or []:
+                        if tc.get("id") == _tcid and tc.get("name") == "request_travel_info":
+                            # 解析工具返回的 JSON 结果
+                            _raw = getattr(m, "content", "") or ""
+                            if isinstance(_raw, list):
+                                _raw = next((b["text"] for b in _raw if isinstance(b, dict) and b.get("type") == "text"), "")
+                            try:
+                                _payload = json.loads(_raw) if isinstance(_raw, str) else _raw
+                                # 解包 MCP 信封
+                                if isinstance(_payload, dict) and "result" in _payload:
+                                    _inner = _payload["result"]
+                                    if isinstance(_inner, str):
+                                        _inner = json.loads(_inner)
+                                    if isinstance(_inner, dict) and _inner.get("__a2ui_form"):
+                                        _request_info_form = {
+                                            "type": "form_card",
+                                            "id": _inner.get("id", "llm_request_info"),
+                                            "reason": "llm_determined",
+                                            "title": _inner.get("title", "完善旅行信息"),
+                                            "message": _inner.get("message", ""),
+                                            "fields": _inner.get("fields", []),
+                                        }
+                            except Exception:
+                                pass
+            if _request_info_form is not None:
+                await _send_a2ui_if_enabled(ws, cfg, _request_info_form)
+                await ws.send_text("💡 请在上方表单中补充信息，我会根据你的回答继续规划。")
+                # 本轮不更新消息历史，等待用户填写表单后重新处理
+                messages.pop()
+                logger.info("[session=%s] request_travel_info detected, awaiting form_response", session_id)
+                continue
+
             final_text = None
             for m in reversed(raw_messages):
                 if isinstance(m, HumanMessage):
@@ -621,9 +733,25 @@ async def websocket_endpoint(ws: WebSocket):
                     if final_text:
                         break
 
+            # ── 构建 tool_call_id → tool_name 索引（地图块 & 地点卡片共用）─────
+            call_id_to_name: dict[str, str] = {}
+            for m in raw_messages:
+                if not isinstance(m, AIMessage):
+                    continue
+                for tc in getattr(m, "tool_calls", []) or []:
+                    cid = tc.get("id") or ""
+                    name = tc.get("name") or ""
+                    if cid and name:
+                        call_id_to_name[cid] = name
+
             # ── 追加地图 / 天气 JSON 块 ───────────────────────────────────────
-            map_blocks    = _extract_map_blocks(raw_messages)
+            map_blocks    = _extract_map_blocks(raw_messages, call_id_to_name)
             weather_block = _extract_weather_block(raw_messages)
+
+            # ── 发送 A2UI 地点卡片（从搜索结果中自动生成）──────────────────
+            place_cards = extract_place_cards(raw_messages, call_id_to_name)
+            for pc in place_cards:
+                await _send_a2ui_if_enabled(ws, cfg, pc)
 
             # 调试日志：记录本轮工具调用名称和地图块类型
             _tool_names = []
@@ -634,32 +762,12 @@ async def websocket_endpoint(ws: WebSocket):
             import re as _re
             _block_types = _re.findall(r'"__type":\s*"([^"]+)"', map_blocks)
             logger.info(
-                "[session=%s] tools=%s  map_blocks=%s  weather=%s  msgs=%d",
-                session_id, _tool_names, _block_types, bool(weather_block), len(messages),
+                "[session=%s] tools=%s  map_blocks=%s  weather=%s",
+                session_id, _tool_names, _block_types, bool(weather_block),
             )
 
-            # ── 更新纯对话历史：从 raw_messages 中提取非动态-system 的消息 ────
-            # raw_messages 包含 _invoke_input 里所有消息 + 本轮新增的 AI/Tool 消息。
-            # 我们只保留非 SystemMessage 的部分（动态 system prompt 不进历史）。
-            cleaned = _clean_messages_for_next_turn(raw_messages)
-            messages = [m for m in cleaned if not isinstance(m, type(None))]
-            # 过滤掉动态注入的 SystemMessage（只保留 L1 压缩摘要 SystemMessage）
-            from langchain_core.messages import SystemMessage as _SysMsg2
-            messages = [
-                m for m in messages
-                if not isinstance(m, _SysMsg2)
-                or "\u3010\u5386\u53f2\u5bf9\u8bdd\u6458\u8981\u3011" in str(getattr(m, "content", ""))  # 保留 L1 摘要
-                or "[Conversation Summary]" in str(getattr(m, "content", ""))
-            ]
-
-            # ── L3：轮次结束后自动提取用户偏好 ───────────────────────────────
-            if context.user_profile is not None:
-                try:
-                    context.user_profile.extract_preferences_from_messages(
-                        messages, lang=context.lang
-                    )
-                except Exception as _pe:
-                    logger.debug("[L3 profile] 偏好提取失败（非致命）: %s", _pe)
+            # 清理消息历史，避免 DeepSeek 400 错误
+            messages = _clean_messages_for_next_turn(raw_messages)
 
             reply = final_text or "(没有生成回复)"
             if map_blocks:
@@ -669,17 +777,6 @@ async def websocket_endpoint(ws: WebSocket):
 
             await ws.send_text(reply)
     except WebSocketDisconnect:
-        # ── session 结束：将 L1 摘要存入 L3 用户历史 ──────────────────────
-        if context.memory_compressor is not None and context.user_profile is not None:
-            try:
-                persisted = context.memory_compressor.load_persisted_summary()
-                if persisted:
-                    context.user_profile.add_session_summary(
-                        session_id=session_id, summary=persisted
-                    )
-                    logger.info("[L3] session %s 摘要已存入用户历史", session_id)
-            except Exception as _se:
-                logger.debug("[L3 persist] 摘要存储失败（非致命）: %s", _se)
         logger.info("WebSocket 连接断开：%s", session_id)
 
 

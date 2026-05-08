@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <title>智能旅行助手</title>
     <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/a2ui-cards.css" />
     <!-- Marked.js for Markdown rendering -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <!-- 高德地图 JS API v2.0（key 由后端动态注入，勿在此处硬编码） -->
@@ -17,8 +18,12 @@
       </header>
 
       <main class="main">
-        <!-- 左侧：对话区 -->
+        <!-- 对话区 -->
         <section class="chat-panel">
+          <div class="chat-toolbar">
+            <button class="btn-sessions" id="btn-sessions" onclick="_toggleSessionDropdown()" title="会话列表">☰ 会话</button>
+            <button class="btn-secondary" onclick="clearHistory()" title="清除对话记录">🗑</button>
+          </div>
           <div id="chat-log" class="chat-log" data-placeholder="💬 试试问我：
 帮我规划一个 3 天的成都美食+景点之旅
 
@@ -32,7 +37,14 @@
               placeholder="输入消息，按 Enter 发送"
             />
             <button id="send-btn" class="btn-primary">发送</button>
-            <button class="btn-secondary" onclick="clearHistory()" title="清除对话记录">🗑</button>
+          </div>
+          <!-- 会话下拉面板 -->
+          <div class="session-dropdown" id="session-dropdown" style="display:none;">
+            <div class="session-dropdown-header">
+              <span>📋 会话列表</span>
+              <button class="session-new-btn" onclick="_newSession()">＋ 新建</button>
+            </div>
+            <div class="session-list" id="session-list"></div>
           </div>
         </section>
 
@@ -83,5 +95,6 @@
     </div>
 
     <script src="/static/app.js"></script>
+    <script src="/static/a2ui-cards.js"></script>
   </body>
 </html>
