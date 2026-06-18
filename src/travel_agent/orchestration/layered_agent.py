@@ -1,3 +1,14 @@
+"""
+实验性的五层旅行 Agent 编排器。
+
+它把一次旅行规划拆成 requirement、research、planning、risk、render，
+每层只向模型暴露该阶段允许的 Tool，并在执行后用 Validator 做最低校验。
+失败时会回滚到最近成功 checkpoint 后重试。
+
+该模式比自由 ReAct 更可控，但每层都会创建新的 Agent，且规则校验仍较粗；
+当前默认配置关闭，主要用于学习和离线评测。
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -21,6 +32,7 @@ LAYER_ORDER: List[str] = [
 
 
 def _make_layer_prompt(base_prompt: str, layer_name: str, allowed_tool_names: List[str]) -> str:
+    """在基础 Prompt 后追加当前阶段及工具白名单约束。"""
     allowed_text = ", ".join(allowed_tool_names) if allowed_tool_names else "(none)"
     return (
         f"{base_prompt}\n\n"
@@ -32,6 +44,7 @@ def _make_layer_prompt(base_prompt: str, layer_name: str, allowed_tool_names: Li
 
 
 def _collect_tool_calls(messages: List[Any]) -> List[str]:
+    """从本层新增的 AIMessage 中收集实际请求过的工具名称。"""
     names: List[str] = []
     for msg in messages:
         if isinstance(msg, AIMessage):
@@ -43,6 +56,7 @@ def _collect_tool_calls(messages: List[Any]) -> List[str]:
 
 
 def _extract_text(messages: List[Any]) -> str:
+    """拍平消息文本，供轻量场景标签识别使用。"""
     parts: List[str] = []
     for m in messages:
         content = getattr(m, "content", "") or ""
@@ -54,6 +68,7 @@ def _extract_text(messages: List[Any]) -> str:
 
 
 def _infer_scenario_tags(messages: List[Any]) -> Set[str]:
+    """识别需要额外天气/交通校验的特殊旅行场景。"""
     t = _extract_text(messages).lower()
     tags: Set[str] = set()
     if any(k in t for k in ("老人", "老年", "无障碍", "轮椅")):
@@ -199,6 +214,7 @@ class LayeredTravelAgent:
         self.runtime_tool_selector = runtime_tool_selector
 
     async def ainvoke(self, inputs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        # messages 是跨层累积的执行状态；checkpoint 保存最近通过校验的副本。
         messages: List[Any] = list(inputs.get("messages") or [])
         traces: List[LayerTrace] = []
         scenario_tags = _infer_scenario_tags(messages)
@@ -212,6 +228,7 @@ class LayeredTravelAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[LayeredAgent] runtime tool selection failed, fallback to default: %s", exc)
 
+        # 使用 list 浅拷贝隔离消息列表本身；消息对象按 LangChain 约定视为不可变。
         checkpoints: Dict[str, List[Any]] = {"start": list(messages)}
         last_ok_key = "start"
 

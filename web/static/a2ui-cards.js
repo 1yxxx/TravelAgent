@@ -1,18 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  A2UI Cards  ·  Frontend renderer for form_card & place_card
-//  Depends on: app.js (loads first)
+//  A2UI 卡片渲染器：负责 form_card 与 place_card
+//  依赖 app.js 中定义的 WebSocket、地图和会话持久化函数，因此需后加载。
 // ─────────────────────────────────────────────────────────────────────────────
 
 window.A2UICards = (function () {
   "use strict";
 
-  // ── DOM helpers ────────────────────────────────────────────────────────
+  // ── DOM 辅助函数 ───────────────────────────────────────────────────────
 
   function esc(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
   function el(tag, className, attrs) {
+    // 文本统一使用 textContent 写入，避免地点/API 数据被当作 HTML 执行。
     var e = document.createElement(tag);
     if (className) { e.className = className; }
     if (attrs) {
@@ -24,18 +25,18 @@ window.A2UICards = (function () {
     return e;
   }
 
-  // ── Form card ──────────────────────────────────────────────────────────
+  // ── 信息补充表单卡片 ──────────────────────────────────────────────────
 
   function renderFormCard(payload) {
     var card = el("div", "a2ui-card a2ui-form-card", { "data-a2ui-id": payload.id || "" });
 
-    // Header
+    // 卡片头部
     var header = el("div", "a2ui-card-header");
     header.appendChild(el("span", "a2ui-card-icon", { text: "\u{1F4DD}" }));
     header.appendChild(el("span", "a2ui-card-title", { text: payload.title || "完善旅行信息" }));
     card.appendChild(header);
 
-    // Body
+    // 根据后端下发的字段 Schema 动态构造表单主体。
     var body = el("div", "a2ui-card-body");
     if (payload.message) {
       body.appendChild(el("p", "a2ui-card-msg", { text: payload.message }));
@@ -87,7 +88,7 @@ window.A2UICards = (function () {
     body.appendChild(fieldsWrap);
     card.appendChild(body);
 
-    // Footer
+    // 操作区
     var footer = el("div", "a2ui-card-footer");
     var submitBtn = el("button", "a2ui-btn a2ui-btn-submit", { text: "发送" });
     var cancelBtn = el("button", "a2ui-btn a2ui-btn-cancel", { text: "取消" });
@@ -125,25 +126,25 @@ window.A2UICards = (function () {
       return;
     }
 
-    // Disable form
+    // 提交后锁定表单，防止用户重复发送同一响应。
     var submitBtn = formEl.querySelector(".a2ui-btn-submit");
     if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "已发送"; }
     var allInputs = formEl.querySelectorAll("input, select, textarea");
     allInputs.forEach(function (inp) { inp.disabled = true; });
 
-    // Send via WebSocket (ws is from app.js global scope, not window.ws)
+    // 通过 app.js 的全局 WebSocket 发送结构化响应。
     var a2uiMsg = "@@A2UI@@" + JSON.stringify({ type: "form_response", id: cardId, data: data });
     if (typeof ws !== "undefined" && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(a2uiMsg);
     }
 
-    // Persist submission
+    // 同步保存到浏览器会话，便于刷新后重放 UI。
     if (typeof _saveA2UICard === "function") {
       _saveA2UICard({ type: "form_response", id: cardId, data: data });
     }
   }
 
-  // ── Place card ─────────────────────────────────────────────────────────
+  // ── 地点卡片 ──────────────────────────────────────────────────────────
 
   function renderPlaceCard(payload) {
     var places = payload.places || [];

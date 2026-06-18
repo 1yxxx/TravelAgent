@@ -1,12 +1,11 @@
 """
-travel/src/travel_agent/mcp/hooks/tool_interceptors.py
+MCP Tool 调用前后的轻量 Hook。
 
-Before/after hooks for MCP tool calls:
-- Inject session_id and ArtifactStore before a tool executes.
-- Save tool results and append context after a tool returns.
+这些函数用于在工具执行前后统一记录 session、耗时等横切信息。
+它们是普通包装函数，并不是 FastMCP 官方中间件。
 
-These are intended as middleware helpers, not as FastMCP middleware
-(which is not yet part of the public FastMCP API).
+当前 ``register_tools.py`` 已在各 Wrapper 中直接完成结果持久化，
+因此 after hook 只记录耗时并原样返回结果，后续可扩展 tracing/metrics。
 """
 from __future__ import annotations
 
@@ -30,9 +29,9 @@ async def before_tool_call(
     **kwargs: Any,
 ) -> dict:
     """
-    Called immediately before a tool function is invoked.
+    在工具执行前创建调用上下文。
 
-    Returns a context dict that is passed to ``after_tool_call``.
+    返回值会继续传给 ``after_tool_call``，用于计算耗时和关联日志。
     """
     logger.debug("[Hook:before] tool=%s session=%s", tool_name, session_id)
     return {"tool_name": tool_name, "session_id": session_id, "start_ts": time.time()}
@@ -44,12 +43,10 @@ async def after_tool_call(
     store: ArtifactStore,
 ) -> Any:
     """
-    Called after a tool function returns.
+    在工具执行后记录耗时并返回结果。
 
-    - If the tool result is a dict with ``isError=False`` and a ``result`` key,
-      it's already been saved by register_tools; this hook can add extra
-      cross-tool context (e.g. inject artifacts into the session context).
-    - Returns the (potentially modified) result.
+    若结果包含 ``isError=False``、``result`` 等 MCP 信封字段，说明
+    ``register_tools`` 已完成持久化，此处不应重复写 Artifact。
     """
     elapsed = time.time() - ctx.get("start_ts", time.time())
     logger.debug(
@@ -68,9 +65,9 @@ def wrap_tool(
     store: ArtifactStore,
 ) -> Callable[..., Awaitable[Any]]:
     """
-    Wrap an async tool function with before/after hooks.
+    为异步工具套用 before/after hook，并保持原函数名称和文档。
 
-    Usage::
+    示例::
 
         wrapped = wrap_tool(my_tool_fn, "search_poi", session_id, store)
         result = await wrapped(**kwargs)

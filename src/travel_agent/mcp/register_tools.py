@@ -1,13 +1,14 @@
 """
-travel/src/travel_agent/mcp/register_tools.py
+MCP 工具注册与 Core Tool 适配层。
 
-Registers all travel-agent tools with the FastMCP server.
+每个 MCP 工具都是一个薄包装器，统一完成：
+1. 从请求头读取 ``X-Travel-Session-Id``；
+2. 从 MCP lifespan 获取当前会话的 ArtifactStore；
+3. 调用 ``nodes/core_nodes`` 中的底层 Tool；
+4. 持久化结果并返回统一的 MCP 信封。
 
-Each tool is a thin async wrapper that:
-1. Extracts ``X-Travel-Session-Id`` from the request headers.
-2. Gets (or creates) a per-session :class:`ArtifactStore` from the lifespan context.
-3. Calls the underlying core-node function with cfg + store injected.
-4. Persists the result and returns it to the client.
+这一层相当于 Agent 协议 DTO 到内部工具参数的 Adapter。修改底层 Tool
+签名时必须同步检查这里的字段映射，否则会在运行时产生参数校验错误。
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ except Exception:
 # ── lazy imports so missing optional deps don't break the import chain ──
 
 def _get_session_id(ctx: Context) -> str:
-    """Extract session id from request headers, fallback to 'default'."""
+    """从 MCP 请求头提取 session_id；异常时降级到 ``default``。"""
     try:
         return ctx.request_context.request.headers.get("X-Travel-Session-Id", "default")
     except Exception:
@@ -39,7 +40,7 @@ def _get_session_id(ctx: Context) -> str:
 
 
 def _get_store(ctx: Context, cfg: Settings) -> ArtifactStore:
-    """Get per-session ArtifactStore from the lifespan context."""
+    """从 lifespan 管理器获取当前 session 对应的 ArtifactStore。"""
     session_id = _get_session_id(ctx)
     mgr = ctx.request_context.lifespan_context          # SessionLifecycleManager
     return mgr.get_store(session_id)
@@ -50,7 +51,7 @@ def _get_store(ctx: Context, cfg: Settings) -> ArtifactStore:
 # ────────────────────────────────────────────────────────────────────────
 
 def register(server: FastMCP, cfg: Settings) -> None:
-    """Register all travel tools on *server*."""
+    """把全部旅行工具注册到指定 FastMCP Server。"""
 
     # ── search_poi ──────────────────────────────────────────────────────
     @server.tool(

@@ -1,3 +1,16 @@
+"""
+FastAPI Web 服务入口。
+
+本模块负责四类边界工作：
+1. 管理 FastAPI 与内置 MCP Server 的启动/关闭生命周期；
+2. 为每个 WebSocket 连接创建独立的 Agent、消息历史和会话上下文；
+3. 将 Agent 的 ToolMessage 转换为地图数据、天气数据和 A2UI 事件；
+4. 托管静态前端，并提供上传、导出等 HTTP 接口。
+
+注意：这里保存的 ``messages`` 是单个 WebSocket 连接内的内存状态。
+浏览器 localStorage 中的“历史会话”不会自动恢复为模型上下文。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +30,8 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, System
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
+# 项目尚未安装为 Python package，因此启动时显式加入 src 目录。
+# 生产化后可改为标准 pyproject.toml 包安装，避免运行时修改 sys.path。
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
@@ -532,6 +547,8 @@ async def index() -> str:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
+    # 后端 session_id 用于隔离 MCP Artifact；它与前端 localStorage 的会话 ID
+    # 不是同一个标识，当前也不会在断线重连时复用。
     session_id = f"travel_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     cfg = load_settings(CONFIG_PATH)
     try:
@@ -542,6 +559,8 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close()
         return
 
+    # 当前连接的模型消息历史。连接关闭后该列表即释放；需要跨连接恢复时，
+    # 应由客户端回传历史或从服务端持久化存储中加载。
     messages = []
 
     try:

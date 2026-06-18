@@ -1,3 +1,14 @@
+"""
+Agent 装配与会话上下文模块。
+
+``build_agent`` 类似 Java 项目中的 Application Configuration/Factory：
+它负责创建 LLM、通过 MCP 获取工具、加载 Skill、构建 ReAct Agent，
+并为当前会话装配 L1/L2/L3 记忆组件。
+
+``ClientContext`` 则保存不直接属于 LangGraph messages 的运行时依赖，
+例如 ArtifactStore、用户画像和记忆压缩器。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -148,8 +159,11 @@ from travel_agent.utils.prompts import get_system_prompt
 from travel_agent.utils.logging import logger
 from travel_agent.skills.skills_io import load_skills
 
+
 @dataclass
 class ClientContext:
+    """单个 Agent 会话的运行时上下文，不在不同用户连接之间共享。"""
+
     cfg: Settings
     session_id: str
     node_manager: NodeManager
@@ -336,6 +350,7 @@ class ClientContext:
 
 
 def _build_llm(cfg: Settings) -> BaseChatModel:
+    """根据兼容接口类型创建聊天模型，并对 DeepSeek 做协议适配。"""
     # DeepSeek API 不接受 list 类型的 content，需要用子类拍平；
     # 其他兼容 OpenAI 格式的服务（智谱、通义等）直接用标准 ChatOpenAI。
     cls = DeepSeekChatOpenAI if "deepseek" in cfg.llm.base_url.lower() else ChatOpenAI
@@ -385,6 +400,7 @@ async def build_agent(cfg: Settings, session_id: str, *, lang: str = "zh"):
     """
     from pathlib import Path
 
+    # LLM 实例同时供主 Agent 和 L1 摘要压缩器使用。
     llm = _build_llm(cfg)
 
     # ── 连接 MCP Server，获取工具 ──────────────────────────────────────
@@ -402,6 +418,7 @@ async def build_agent(cfg: Settings, session_id: str, *, lang: str = "zh"):
             }
         }
     )
+    # 此处拿到的是 MCP 适配后的 LangChain Tool，而不是直接导入的 core_nodes。
     tools: List[BaseTool] = await client.get_tools()
     logger.info("[Agent] fetched %d tools from MCP Server at %s", len(tools), mcp_url)
 

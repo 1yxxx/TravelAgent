@@ -1,3 +1,15 @@
+"""
+Tool 元数据管理与运行时筛选。
+
+NodeManager 不执行工具，它只负责：
+- 按工具名称映射到 requirement/research/planning/risk/render 层；
+- 为工具附加场景标签；
+- 根据当前消息中的关键词裁剪每层可见工具集合。
+
+场景识别目前是轻量规则，不是语义分类模型，因此应视为优化策略，
+不能替代关键业务校验。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -17,6 +29,7 @@ LAYER_ORDER: List[str] = [
 
 
 def _default_layer_for_tool(tool_name: str) -> str:
+    """根据命名约定推断工具所属阶段，允许调用方通过 map 覆盖默认值。"""
     name = (tool_name or "").strip().lower()
 
     if name in {"validate_json", "fix_json"}:
@@ -39,6 +52,7 @@ def _default_layer_for_tool(tool_name: str) -> str:
 
 
 def _default_tags_for_tool(tool_name: str) -> Set[str]:
+    """为工具生成用于场景过滤的默认能力标签。"""
     name = (tool_name or "").strip().lower()
 
     if name in {"validate_json", "fix_json"}:
@@ -72,6 +86,7 @@ def _default_tags_for_tool(tool_name: str) -> Set[str]:
 
 
 def _extract_text_from_messages(messages: List[BaseMessage]) -> str:
+    """统一拍平 LangChain 的字符串/内容块消息，供关键词规则扫描。"""
     chunks: List[str] = []
     for m in messages:
         content = getattr(m, "content", "") or ""
@@ -87,6 +102,7 @@ def _extract_text_from_messages(messages: List[BaseMessage]) -> str:
 
 
 def _infer_scenario_tags(text: str) -> Set[str]:
+    """从用户文本推断人群、预算、偏好和行程长度等场景标签。"""
     t = (text or "").lower()
     tags: Set[str] = set()
 
@@ -121,6 +137,7 @@ def _infer_scenario_tags(text: str) -> Set[str]:
 
 
 def _tool_matches_scenario(tool_tags: Set[str], scenario_tags: Set[str]) -> bool:
+    """判断工具是否应在当前场景中保留；无场景标签时不做裁剪。"""
     if not scenario_tags:
         return True
 
@@ -143,7 +160,10 @@ def _tool_matches_scenario(tool_tags: Set[str], scenario_tags: Set[str]) -> bool
 @dataclass
 class NodeManager:
     """
-    负责管理所有可用的工具节点，提供按名称查询等能力。
+    管理 Agent 可用工具及其层级/场景元数据。
+
+    ``tool_layer_map`` 和 ``tool_tags_map`` 可由外部显式传入；未传入时
+    才使用本模块的命名规则自动生成。
     """
 
     tools: List[BaseTool] = field(default_factory=list)
@@ -151,6 +171,7 @@ class NodeManager:
     tool_tags_map: Dict[str, Set[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        # dataclass 初始化完成后补齐派生元数据，避免调用方重复维护。
         if not self.tool_layer_map:
             self.tool_layer_map = {
                 t.name: _default_layer_for_tool(t.name)
@@ -180,6 +201,7 @@ class NodeManager:
         return {layer: self.get_tools_by_layer(layer, scenario_tags=scenario_tags) for layer in LAYER_ORDER}
 
     def grouped_tools_for_messages(self, messages: List[BaseMessage]) -> Dict[str, List[BaseTool]]:
+        """先识别场景，再返回分层后的动态工具白名单。"""
         tags = self.infer_scenario_tags_from_messages(messages)
         return self.grouped_tools(scenario_tags=tags)
 

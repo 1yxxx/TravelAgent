@@ -1,9 +1,12 @@
 """
-travel/src/travel_agent/storage/agent_memory.py
+会话级 Artifact 存储。
 
-Session-scoped artifact storage for the travel agent.
-Each session stores tool outputs (POI lists, weather, routes, etc.)
-as JSON files under artifacts/<session_id>/<node_id>/<artifact_id>.json.
+每个 session 把 POI、天气、路线等工具结果写为独立 JSON 文件，并在
+``meta.json`` 中维护索引。Agent 下一轮可以把每类工具的最新结果摘要
+重新注入 System Prompt，避免重复查询。
+
+当前实现面向单进程演示环境，没有文件锁或事务；多进程生产环境应迁移到
+数据库、Redis 或对象存储。
 """
 from __future__ import annotations
 
@@ -64,6 +67,7 @@ class ArtifactStore:
         self.blobs_dir = self.artifacts_dir / session_id
         self.meta_path = self.blobs_dir / "meta.json"
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
+        # 首次创建会话目录时初始化元数据索引，后续所有 Artifact 都追加到该索引。
         if not self.meta_path.exists() or self.meta_path.stat().st_size == 0:
             self._save_meta_list([])
 
@@ -81,6 +85,7 @@ class ArtifactStore:
             json.dump([asdict(m) for m in metas], fh, ensure_ascii=False, indent=2)
 
     def _append_meta(self, meta: ArtifactMeta) -> None:
+        # 当前采用“读全量-追加-写全量”的简单实现，不具备跨进程原子性。
         metas = self._load_meta_list()
         metas.append(meta)
         self._save_meta_list(metas)

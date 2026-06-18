@@ -1,17 +1,15 @@
 """
-travel/src/travel_agent/mcp/server.py
+旅行工具 MCP Server 的创建与独立启动入口。
 
-Travel-agent MCP server built with FastMCP.
-Each request carries an ``X-Travel-Session-Id`` header so that the
-lifespan-context SessionLifecycleManager can provide a per-session
-ArtifactStore to every tool.
+Agent 通过 ``MultiServerMCPClient`` 连接本服务。每次工具请求都携带
+``X-Travel-Session-Id``，工具注册层据此获取对应会话的 ArtifactStore，
+从而隔离不同会话产生的搜索、天气和行程结果。
 
-Usage (standalone)::
+本模块只负责创建和运行 MCP Server，具体工具定义位于
+``mcp/register_tools.py``。
 
-    python -m travel_agent.mcp.server
-
-Or call ``create_server(cfg)`` from agent_fastapi.py / cli.py and run it
-inside an asyncio-compatible thread.
+可独立运行：``python -m travel_agent.mcp.server``；
+Web 模式下则由 ``agent_fastapi.py`` 的 lifespan 在后台启动。
 """
 from __future__ import annotations
 
@@ -34,14 +32,16 @@ except Exception:
 
 def create_server(cfg: Settings) -> FastMCP:
     """
-    Build and return a configured :class:`FastMCP` instance.
+    创建并配置 FastMCP 实例，但不在此函数中启动网络监听。
 
-    The server is **not** started here — call ``server.run(...)``
-    or mount it into an existing ASGI app.
+    调用方可以执行 ``server.run(...)``，也可以获取 ASGI app 后交给
+    Uvicorn 托管。
     """
 
     @asynccontextmanager
     async def session_lifespan(server: FastMCP) -> AsyncIterator[SessionLifecycleManager]:
+        # lifespan 的返回值会作为 MCP 请求上下文共享给各工具，
+        # register_tools 通过它取得按 session_id 隔离的 ArtifactStore。
         logger.info("[MCP] starting session lifecycle manager …")
         mgr = SessionLifecycleManager(
             artifacts_root=cfg.project.outputs_dir,
@@ -61,12 +61,14 @@ def create_server(cfg: Settings) -> FastMCP:
         lifespan=session_lifespan,
     )
 
+    # 工具在 Server 创建阶段一次性注册；运行期间只处理调用和会话数据。
     register_tools.register(server, cfg)
     logger.info("[MCP] server '%s' created with %d tool(s)", cfg.mcp_server.server_name, len(server._tool_manager._tools))
     return server
 
 
 def main() -> None:
+    """独立启动 MCP Server，主要用于调试或供外部 MCP Client 连接。"""
     cfg = load_settings(default_config_path())
     server = create_server(cfg)
     server.settings.host = cfg.mcp_server.connect_host

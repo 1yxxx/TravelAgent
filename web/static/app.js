@@ -7,7 +7,9 @@ let ws = null;
 const markers = [];
 let polylines = [];
 
-// ── 会话管理 ───────────────────────────────────────────────────────────────
+// ── 浏览器侧会话管理 ───────────────────────────────────────────────────────
+// 这里只保存 UI 历史、地图块和 A2UI 卡片。当前会话 ID 不会发送给后端，
+// 因此页面看见的历史记录不代表 WebSocket 重连后模型仍拥有相同上下文。
 const STORAGE_KEY_SESSIONS = "travel_sessions_v2";   // 会话列表（替代旧的单 key 模式）
 const MAX_SESSIONS          = 50;                     // 最多保留 50 个会话
 const MAX_HISTORY_ITEMS     = 60;                     // 每个会话最多 60 条消息
@@ -101,6 +103,7 @@ function _migrateOldData() {
 
 // ── Markdown renderer ─────────────────────────────────────────────────────
 const md = (text) => {
+  // 模型输出会被渲染成 HTML；生产环境应在 marked.parse 后增加 HTML Sanitizer。
   if (window.marked) {
     return marked.parse(text, { breaks: true, gfm: true });
   }
@@ -503,6 +506,8 @@ function initWebSocket() {
 
   ws.onmessage = (event) => {
     const text = event.data || "";
+    // A2UI 使用文本前缀复用同一 WebSocket：带前缀的消息按结构化事件处理，
+    // 其余内容按普通助手 Markdown 回复处理。
     if (text.startsWith(A2UI_PREFIX)) {
       try {
         const payload = JSON.parse(text.slice(A2UI_PREFIX.length));
@@ -526,6 +531,7 @@ function initWebSocket() {
       appendMessage("assistant", `⚠️ 连接中断（code ${ev.code}），${(wsReconnectDelay/1000).toFixed(1)}s 后自动重连…`);
       wsReconnectTimer = setTimeout(() => {
         wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
+        // 当前重连会在服务端创建新的 Agent session，不会自动恢复旧 messages。
         initWebSocket();
       }, wsReconnectDelay);
     } else {

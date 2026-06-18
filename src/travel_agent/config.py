@@ -1,3 +1,10 @@
+"""
+项目配置模型与 TOML 加载逻辑。
+
+配置使用 Pydantic 做运行时校验。所有 ``Path`` 字段都以配置文件所在目录
+为基准解析，避免因启动命令的当前工作目录不同而写入错误位置。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,6 +34,7 @@ def _resolve_relative_path(v: Path, info: ValidationInfo) -> Path:
 
 
 def _resolve_paths_recursively(value: Any, info: ValidationInfo) -> Any:
+    """递归处理容器中的 Path，为后续扩展嵌套配置保留统一行为。"""
     if value is None:
         return None
     if isinstance(value, Path):
@@ -39,6 +47,7 @@ def _resolve_paths_recursively(value: Any, info: ValidationInfo) -> Any:
 
 
 class ConfigBaseModel(BaseModel):
+    # 配置出现未声明字段时立即报错，防止拼写错误被静默忽略。
     model_config = ConfigDict(extra="forbid")
 
     @field_validator("*", mode="after")
@@ -122,6 +131,7 @@ class Settings(ConfigBaseModel):
 
 
 def load_settings(config_path: str | Path) -> Settings:
+    """读取 TOML，并通过 context 把配置目录传给 Path 字段校验器。"""
     p = Path(config_path).expanduser().resolve()
     data = tomllib.loads(p.read_text(encoding="utf-8"))
     return Settings.model_validate(data, context={"config_dir": p.parent})
