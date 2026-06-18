@@ -6,7 +6,7 @@ from unittest import TestCase
 
 from langchain_core.messages import HumanMessage
 
-from travel_agent.agent import ClientContext
+from travel_agent.agent.context import ClientContext
 
 
 class TestPrecheck(TestCase):

@@ -1,0 +1,29 @@
+services:
+  travel-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: travel-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      # API Key 配置只在本机保存，不复制进镜像。
+      - ./config.toml:/app/config.toml:ro
+      # 保留用户画像、会话 Artifact 和 MCP 缓存。
+      - ./travel_data:/app/travel_data
+      - ./travel_outputs:/app/travel_outputs
+      - ./.travel:/app/.travel
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)); assert data['status'] == 'ok'"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from travel_agent.orchestration.layered_agent import (
+from travel_agent.orchestration import (
     LayerPolicy,
     LayerTrace,
     LayerValidator,

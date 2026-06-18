@@ -6,7 +6,8 @@ from unittest import IsolatedAsyncioTestCase
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from travel_agent.agent import ClientContext, choose_memory_framework
+from travel_agent.agent.context import ClientContext
+from travel_agent.agent.memory_switch import choose_memory_framework
 
 
 class TestMemoryFramework(IsolatedAsyncioTestCase):

@@ -1,11 +1,11 @@
 """
-travel/src/travel_agent/nodes/core_nodes/render_map.py
+travel/src/travel_agent/tools/rendering/render_map.py
 
 A "render-only" tool that formats POI or route data into a structured JSON
 block that the frontend can parse to place markers / polylines on the map.
 
 The tool does NOT make any external API calls; it just validates and packages
-the data.  The backend (agent_fastapi.py) will detect the tool's output and
+the data.  The backend (api/map_extractor.py) will detect the tool's output and
 append it verbatim to the assistant reply so the frontend can process it.
 """
 from __future__ import annotations

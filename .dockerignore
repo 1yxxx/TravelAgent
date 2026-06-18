@@ -1,0 +1,26 @@
+.git
+.github
+.idea
+.vscode
+
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.log
+
+# 密钥和本地运行数据通过 Compose 挂载。
+config.toml
+.env
+.env.*
+travel_data
+travel_outputs
+.travel
+
+tests
+docs
+pic
+scripts
+tmp
+.tmp

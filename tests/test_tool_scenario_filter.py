@@ -6,7 +6,7 @@ from unittest import TestCase
 
 from langchain_core.messages import HumanMessage
 
-from travel_agent.nodes.node_manager import NodeManager
+from travel_agent.agent.node_manager import NodeManager
 
 
 class TestToolScenarioFilter(TestCase):

@@ -1,12 +1,10 @@
 """
-Agent 后端的 A2UI 卡片 Payload 生成器。
+A2UI 双向卡片协议桥接层。
 
-当前生成两类卡片：
-- ``form_card``：根据前置校验失败原因生成信息补充表单；
-- ``place_card``：从搜索类 ToolMessage 中提取景点/酒店/餐厅卡片。
-
-本模块只构造结构化字典，实际 WebSocket 发送由 ``agent_fastapi.py``
-负责，浏览器渲染由 ``web/static/a2ui-cards.js`` 负责。
+合并了 WebSocket 处理和卡片生成的 A2UI 相关逻辑：
+- A2UI 事件发送工具
+- form_card（信息补充表单）生成
+- place_card（地点详情卡片）自动提取
 """
 
 from __future__ import annotations
@@ -14,7 +12,12 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-# ── 不同前置校验失败原因对应的表单字段 ───────────────────────────────────────
+from fastapi import WebSocket
+
+from travel_agent.api.message_utils import extract_mcp_text, unwrap_mcp_envelope, safe_json_load
+
+
+# ── form_card 表单字段配置 ────────────────────────────────────────────────────
 
 _FORM_FIELD_CONFIGS: Dict[str, List[Dict[str, Any]]] = {
     "query_too_short": [
@@ -102,15 +105,45 @@ _FORM_TITLES: Dict[str, str] = {
     "missing_duration":    "出行天数",
 }
 
+# ── place_card 工具映射 ───────────────────────────────────────────────────────
+
+_TOOL_CATEGORY_MAP: Dict[str, str] = {
+    "search_poi":        "poi",
+    "search_hotel":      "hotel",
+    "search_restaurant": "restaurant",
+}
+
+_CATEGORY_LABELS: Dict[str, str] = {
+    "poi":        "🏛️ 景点",
+    "hotel":      "🏨 酒店",
+    "restaurant": "🍜 餐厅",
+}
+
+
+# ── A2UI 事件发送工具 ─────────────────────────────────────────────────────────
+
+def build_a2ui_line(prefix: str, payload: Dict[str, Any]) -> str:
+    """构建 A2UI 事件行字符串。"""
+    return prefix + json.dumps(payload, ensure_ascii=False)
+
+
+async def send_a2ui_if_enabled(ws: WebSocket, cfg, payload: Dict[str, Any]) -> None:
+    """条件发送 A2UI 事件到 WebSocket。"""
+    if not getattr(cfg, "a2ui", None) or not cfg.a2ui.enabled:
+        return
+    await ws.send_text(build_a2ui_line(cfg.a2ui.event_prefix, payload))
+
+
+# ── form_card 生成 ─────────────────────────────────────────────────────────────
 
 def build_form_card_payload(precheck: Dict[str, Any]) -> Dict[str, Any]:
     """把失败的前置校验结果转换为 A2UI ``form_card``。
 
-    参数：
+    Args:
         precheck: 包含 ``ok=False``、``reason`` 和 ``suggestion`` 的字典。
 
-    返回：
-        可直接交给 ``_send_a2ui_if_enabled`` 的 A2UI Payload。
+    Returns:
+        A2UI Payload 字典。
     """
     reason = precheck.get("reason", "missing_destination")
     fields = _FORM_FIELD_CONFIGS.get(reason, _FORM_FIELD_CONFIGS["missing_destination"])
@@ -126,20 +159,7 @@ def build_form_card_payload(precheck: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ── 从 ToolMessage 提取地点卡片 ──────────────────────────────────────────────
-
-_TOOL_CATEGORY_MAP: Dict[str, str] = {
-    "search_poi":        "poi",
-    "search_hotel":      "hotel",
-    "search_restaurant": "restaurant",
-}
-
-_CATEGORY_LABELS: Dict[str, str] = {
-    "poi":        "🏛️ 景点",
-    "hotel":      "🏨 酒店",
-    "restaurant": "🍜 餐厅",
-}
-
+# ── place_card 提取 ────────────────────────────────────────────────────────────
 
 def extract_place_cards(
     messages: list,
@@ -148,15 +168,14 @@ def extract_place_cards(
 ) -> List[Dict[str, Any]]:
     """扫描搜索工具产生的 ToolMessage，生成 A2UI ``place_card``。
 
-    同一轮中，同一种搜索工具最多生成一张卡片，避免 Agent 重复调用工具时
-    前端出现大量重复内容。
+    同一轮中，同一种搜索工具最多生成一张卡片。
 
-    参数：
-        messages: 当前轮 Agent 返回的完整消息列表；
-        call_id_to_name: ``tool_call_id -> 工具名`` 映射；
+    Args:
+        messages: 当前轮 Agent 返回的完整消息列表。
+        call_id_to_name: ``tool_call_id -> 工具名`` 映射。
         max_places: 每张卡片最多展示的地点数量。
 
-    返回：
+    Returns:
         A2UI 地点卡片 Payload 列表。
     """
     from langchain_core.messages import ToolMessage
@@ -171,31 +190,21 @@ def extract_place_cards(
         tname = call_id_to_name.get(getattr(m, "tool_call_id", "") or "", "")
         if tname not in _TOOL_CATEGORY_MAP:
             continue
-        # 同一轮内每类搜索工具只生成一张卡片，避免重复渲染。
         if tname in seen_tool_names:
             continue
         seen_tool_names.add(tname)
 
         raw = getattr(m, "content", "") or ""
-        # MCP Adapter 可能把文本包装为 content block 列表，先还原原始文本。
-        if isinstance(raw, list):
-            raw = next((b["text"] for b in raw if isinstance(b, dict) and b.get("type") == "text"), "")
+        raw = extract_mcp_text(raw)
 
-        try:
-            payload = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
+        payload = safe_json_load(raw)
+        if payload is None:
             continue
 
-        # 解开 MCP 统一信封 {artifact_id, result, isError}。
-        if isinstance(payload, dict) and "result" in payload and "artifact_id" in payload:
-            if payload.get("isError"):
-                continue
-            payload = payload["result"]
-        # 部分工具会在 result 中再次返回 JSON 字符串，需要二次反序列化。
+        payload = unwrap_mcp_envelope(payload)
         if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
+            payload = safe_json_load(payload)
+            if payload is None:
                 continue
 
         items = payload if isinstance(payload, list) else []
@@ -211,7 +220,6 @@ def extract_place_cards(
             if not isinstance(item, dict):
                 continue
 
-            # 高德照片字段可能是列表，也可能包在 {"photo": [...]} 中。
             raw_photos = item.get("photos") or []
             if isinstance(raw_photos, dict):
                 raw_photos = raw_photos.get("photo") or []
@@ -221,7 +229,6 @@ def extract_place_cards(
                 if url and url.startswith("http"):
                     photos.append(url)
 
-            # 前端地图只接受有效数值坐标；解析失败时显式返回 None。
             lng = None
             lat = None
             try:
@@ -233,7 +240,6 @@ def extract_place_cards(
                 lng = None
                 lat = None
 
-            # 将评分和人均消费压缩成卡片摘要，避免前端重复拼装业务格式。
             meta_parts: List[str] = []
             if item.get("rating"):
                 meta_parts.append(f"⭐{item['rating']}")

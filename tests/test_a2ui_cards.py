@@ -6,7 +6,7 @@ import json
 
 from langchain_core.messages import ToolMessage
 
-from travel_agent.a2ui_cards import build_form_card_payload, extract_place_cards
+from travel_agent.api.a2ui_bridge import build_form_card_payload, extract_place_cards
 
 
 class TestBuildFormCardPayload:

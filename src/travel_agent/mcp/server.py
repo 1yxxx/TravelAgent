@@ -9,7 +9,7 @@ Agent 通过 ``MultiServerMCPClient`` 连接本服务。每次工具请求都携
 ``mcp/register_tools.py``。
 
 可独立运行：``python -m travel_agent.mcp.server``；
-Web 模式下则由 ``agent_fastapi.py`` 的 lifespan 在后台启动。
+Web 模式下则由 ``api/server.py`` 的 lifespan 在后台启动。
 """
 from __future__ import annotations
 
