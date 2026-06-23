@@ -96,7 +96,7 @@ async def build_agent(cfg: Settings, session_id: str, *, lang: str = "zh"):
     logger.info("[Agent] fetched %d tools from MCP Server at %s", len(tools), mcp_url)
 
     # ── 加载 Markdown Skills ──
-    _travel_root = Path(__file__).resolve().parent.parent.parent  # travel/
+    _travel_root = Path(__file__).resolve().parent.parent.parent.parent  # travel/
     skill_dir = str(_travel_root / ".storyline" / "skills")
     try:
         skills_tools = await load_skills(skill_dir=skill_dir)

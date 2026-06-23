@@ -1,7 +1,7 @@
 """
 Tool: request_travel_info — LLM calls this when the user's travel request is
 missing key information (destination, days, budget, etc.). The tool returns a
-structured payload that the WebSocket handler converts into an A2UI form card.
+structured payload that the SSE handler converts into an A2UI form card.
 """
 
 from __future__ import annotations

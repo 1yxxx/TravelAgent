@@ -3,7 +3,7 @@ Web & CLI 展示层。
 
 子模块：
 - ``server``:          FastAPI Web 服务入口（需安装依赖）
-- ``websocket_handler``: WebSocket 聊天端点
+- ``sse_handler``: HTTP POST + SSE 流式聊天端点
 - ``a2ui_bridge``:    A2UI 卡片生成与发送
 - ``map_extractor``:  地图/天气 JSON 提取
 - ``message_utils``:  消息序列化与清理

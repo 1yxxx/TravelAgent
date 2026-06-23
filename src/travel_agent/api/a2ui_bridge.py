@@ -1,18 +1,15 @@
 """
 A2UI 双向卡片协议桥接层。
 
-合并了 WebSocket 处理和卡片生成的 A2UI 相关逻辑：
-- A2UI 事件发送工具
+集中管理与传输协议无关的 A2UI 相关逻辑：
+- 根据配置决定是否构造 A2UI payload
 - form_card（信息补充表单）生成
 - place_card（地点详情卡片）自动提取
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List
-
-from fastapi import WebSocket
+from typing import Any, Dict, List, Optional
 
 from travel_agent.api.message_utils import extract_mcp_text, unwrap_mcp_envelope, safe_json_load
 
@@ -120,18 +117,19 @@ _CATEGORY_LABELS: Dict[str, str] = {
 }
 
 
-# ── A2UI 事件发送工具 ─────────────────────────────────────────────────────────
+# ── A2UI payload 构造 ─────────────────────────────────────────────────────────
 
-def build_a2ui_line(prefix: str, payload: Dict[str, Any]) -> str:
-    """构建 A2UI 事件行字符串。"""
-    return prefix + json.dumps(payload, ensure_ascii=False)
+def a2ui_payload_if_enabled(
+    cfg: Any,
+    payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """A2UI 开启时返回 payload，否则返回 ``None``。
 
-
-async def send_a2ui_if_enabled(ws: WebSocket, cfg, payload: Dict[str, Any]) -> None:
-    """条件发送 A2UI 事件到 WebSocket。"""
+    本函数不再关心 WebSocket/SSE 等传输方式，具体编码由 API 层负责。
+    """
     if not getattr(cfg, "a2ui", None) or not cfg.a2ui.enabled:
-        return
-    await ws.send_text(build_a2ui_line(cfg.a2ui.event_prefix, payload))
+        return None
+    return payload
 
 
 # ── form_card 生成 ─────────────────────────────────────────────────────────────

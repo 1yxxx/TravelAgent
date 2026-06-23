@@ -3,7 +3,7 @@ FastAPI Web 服务入口。
 
 负责：
 1. FastAPI 与内置 MCP Server 的启动/关闭生命周期；
-2. 托管静态前端，并提供 WebSocket、上传、导出等 HTTP 接口。
+2. 托管静态前端，并提供 SSE 聊天、上传、导出等 HTTP 接口。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -34,7 +34,11 @@ INDEX_HTML = os.path.join(WEB_DIR, "index.html")
 from travel_agent.config import load_settings
 from travel_agent.utils.logging import logger
 from travel_agent.api.file_routes import register_file_routes
-from travel_agent.api.websocket_handler import handle_websocket
+from travel_agent.api.sse_handler import (
+    ChatStreamRequest,
+    create_sse_response,
+    stream_chat,
+)
 
 # ── MCP Server 后台任务 ────────────────────────────────────────────────────────
 _mcp_server_task: Optional[asyncio.Task] = None
@@ -111,19 +115,32 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
         cfg = load_settings(CONFIG_PATH)
-        jsapi_key = cfg.map.jsapi_key
+        jsapi_key = (cfg.map.jsapi_key or "").strip()
         html = Path(INDEX_HTML).read_text(encoding="utf-8")
-        html = html.replace(
-            '<script type="text/javascript" id="amap-loader"></script>',
-            f'<script type="text/javascript" '
-            f'src="https://webapi.amap.com/maps?v=2.0&key={jsapi_key}">'
-            f'</script>',
+        loader_placeholder = (
+            '<script type="text/javascript" id="amap-loader"></script>'
         )
+        # Web 服务 Key 与 JS API Key 是两类凭据。未配置 JS API Key 时，
+        # 保留聊天、Agent、MCP、天气等主链路，并让前端显示清晰的地图降级提示。
+        if jsapi_key and not jsapi_key.upper().startswith("YOUR_"):
+            map_loader = (
+                '<script type="text/javascript" '
+                f'src="https://webapi.amap.com/maps?v=2.0&key={jsapi_key}">'
+                "</script>"
+            )
+        else:
+            map_loader = (
+                "<script>"
+                "window.TRAVEL_MAP_ENABLED=false;"
+                "window.TRAVEL_MAP_DISABLED_REASON='未配置高德 JS API Key';"
+                "</script>"
+            )
+        html = html.replace(loader_placeholder, map_loader)
         return html
 
-    @app.websocket("/ws/chat")
-    async def websocket_endpoint(ws):
-        await handle_websocket(ws, CONFIG_PATH)
+    @app.post("/api/chat/stream")
+    async def chat_stream(request: Request, payload: ChatStreamRequest):
+        return create_sse_response(stream_chat(request, payload, CONFIG_PATH))
 
     register_file_routes(app, CONFIG_PATH)
 

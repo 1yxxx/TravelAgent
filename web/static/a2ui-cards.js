@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  A2UI 卡片渲染器：负责 form_card 与 place_card
-//  依赖 app.js 中定义的 WebSocket、地图和会话持久化函数，因此需后加载。
+//  依赖 app.js 中定义的 SSE 请求、地图和会话持久化函数，因此需后加载。
 // ─────────────────────────────────────────────────────────────────────────────
 
 window.A2UICards = (function () {
@@ -132,10 +132,9 @@ window.A2UICards = (function () {
     var allInputs = formEl.querySelectorAll("input, select, textarea");
     allInputs.forEach(function (inp) { inp.disabled = true; });
 
-    // 通过 app.js 的全局 WebSocket 发送结构化响应。
-    var a2uiMsg = "@@A2UI@@" + JSON.stringify({ type: "form_response", id: cardId, data: data });
-    if (typeof ws !== "undefined" && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(a2uiMsg);
+    // 通过 app.js 的统一 HTTP POST + SSE 请求提交结构化响应。
+    if (typeof window._submitA2UIResponse === "function") {
+      window._submitA2UIResponse(cardId, data);
     }
 
     // 同步保存到浏览器会话，便于刷新后重放 UI。

@@ -1,0 +1,9 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy travel-agent:8000 {
+		# 立即转发 SSE 数据块，避免代理层缓冲流式输出。
+		flush_interval -1
+		health_uri /healthz
+	}
+}

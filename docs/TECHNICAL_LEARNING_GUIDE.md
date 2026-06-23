@@ -1,569 +1,556 @@
-# TravelAgent — Agent 工程学习指南
+# TravelAgent — Agent 面试题精解
 
-> 目标读者：正在系统学习 Agent 开发的后端工程师。
-> 阅读方式：理解架构全局 → 跟随请求链路 → 深入各层模式。
-> 基础：2026-06-19 重构后的新目录结构。
-
----
-
-## 目录
-
-1. [项目概览与学习目标](#1-项目概览与学习目标)
-2. [架构总览](#2-架构总览)
-3. [Agent 生命周期：从请求到响应](#3-agent-生命周期从请求到响应)
-4. [Agent 装配：`build_agent()` 工厂模式](#4-agent-装配build_agent-工厂模式)
-5. [模型适配层：DeepSeekChatOpenAI](#5-模型适配层deepseekchatopenai)
-6. [ReAct Agent 机制](#6-react-agent-机制)
-7. [工具工程：分层工具设计](#7-工具工程分层工具设计)
-8. [MCP 协议层：工具发现与调用](#8-mcp-协议层工具发现与调用)
-9. [上下文工程与三层记忆](#9-上下文工程与三层记忆)
-10. [分层编排（可选特性）](#10-分层编排可选特性)
-11. [前端数据协议与输出投射](#11-前端数据协议与输出投射)
-12. [设计模式总结](#12-设计模式总结)
+> 面试题来源：[zero2Agent 面试通关](https://onefly.top/zero2Agent/learn-agent-interview)
+> 回答方式：结合 TravelAgent 项目**实际做了什么**，而非代码片段
 
 ---
 
-## 1. 项目概览与学习目标
+## 一、LangGraph ReAct 状态流转
 
-**TravelAgent** 是一个基于 **LangGraph ReAct** 架构的多工具 AI 旅行规划 Agent。它集成高德地图 API，支持自然语言对话式行程规划、POI 搜索、路线规划、天气查询和预算估算，通过浏览器地图实时交互。
+### Q1 你用 ReAct 还是 Plan-and-Execute？为什么？
 
-### 学完本文后，你将能回答：
+**回答**：本项目**默认用 ReAct**，同时实现了一个**实验性的 Plan-and-Execute 变体**（分层编排），但默认关闭。
 
-1. Agent 在哪里创建？装配了哪些组件？
-2. 模型每轮收到了什么消息？context 如何动态变化？
-3. 模型如何获知有哪些 Tool？Tool Call 如何路由到 Python 函数？
-4. Tool 结果如何重新进入模型上下文？如何持久化？
-5. Prompt、记忆和编排分别控制什么？
-6. 为什么一次请求会触发多次工具调用？ReAct 循环如何终止？
-7. 对话历史、Artifact 和用户画像如何组成三层记忆？
-8. 如何将 Agent 输出投射为前端可渲染的数据？
+**实际实现**：
 
----
+项目使用 `langgraph.prebuilt.create_react_agent()` 创建标准 ReAct Agent。Agent 内部维护一个消息列表作为共享状态，LLM 每次推理后如果决定调用工具，工具执行结果自动追加到消息列表，LLM 再次推理，直到输出纯文本结束。
 
-## 2. 架构总览
+选择 ReAct 的原因是旅行规划场景中用户需求多变——有人先问酒店再补景点，有人直接说"3 天成都"。LLM 自主决定调用什么工具、以什么顺序调用，比固定流水线更灵活。
 
-### 2.1 双服务架构
+**Plan-and-Execute 变体**（分层编排）的实现：把一次规划拆成 5 层（需求确认→搜索调研→行程规划→风险校验→渲染输出），每层只暴露该层允许的工具。比如 research 层只有搜索和天气工具，planning 层只有规划工具。每层执行后做最小校验——research 层必须触发过搜索类工具，planning 层必须触发过编排类工具。失败则回滚到上一个 checkpoint 重试。
 
-```
-┌──────────────────────────────────────────────┐
-│  浏览器 (index.html + app.js)                 │
-│  ┌────────────────┐  ┌──────────────────────┐ │
-│  │ 对话面板        │  │  高德 JS API 地图     │ │
-│  └───────┬────────┘  └──────────┬───────────┘ │
-└──────────│─────────────────────│──────────────┘
-           │ WebSocket            │ JS SDK
-┌──────────▼──────────────────────────────────────┐
-│  FastAPI (port 8000) ── src/travel_agent/api/   │
-│  ├── server.py           应用、lifespan、路由     │
-│  ├── websocket_handler.py  WebSocket 消息处理     │
-│  ├── a2ui_bridge.py       A2UI 卡片生成与发送     │
-│  ├── map_extractor.py     地图/天气 JSON 提取     │
-│  ├── message_utils.py     消息序列化与清理        │
-│  ├── html_render.py       PDF 导出               │
-│  └── file_routes.py       上传/导出路由           │
-└──────────┬──────────────────────────────────────┘
-           │ langchain-mcp-adapters (HTTP)
-┌──────────▼──────────────────────────────────────┐
-│  MCP Server (port 8002) ── src/travel_agent/mcp/│
-│  ├── server.py            FastMCP 创建与生命周期  │
-│  ├── register_tools.py    17 个工具注册           │
-│  ├── adapters.py          工具导入映射与工厂       │
-│  └── hooks/               拦截器 (耗时/鉴权)      │
-└──────────┬──────────────────────────────────────┘
-           │ REST API
-┌──────────▼──────────────────────────────────────┐
-│  高德地图 REST API / DeepSeek LLM API           │
-└─────────────────────────────────────────────────┘
-```
-
-两个进程通过各自的 `lifespan` 管理生命周期。FastAPI 的 `lifespan` 创建 `asyncio.Task` 启动 MCP Server；关闭时取消 Task。MCP Server 不可用时 Agent 无法工作。
-
-### 2.2 依赖拓扑
-
-```
-api/server.py
-  └→ api/websocket_handler.py
-       └→ agent/factory.py (build_agent)
-            ├→ agent/deepseek_adapter.py (DeepSeekChatOpenAI)
-            ├→ langchain_mcp_adapters (连接 MCP Server 获取工具)
-            ├→ agent/context.py (ClientContext)
-            │    ├→ agent/precheck.py
-            │    ├→ agent/memory_switch.py
-            │    └→ storage/ (L1/L2/L3)
-            ├→ agent/node_manager.py (工具元数据)
-            │    └→ orchestration/scenario_tags.py
-            ├→ orchestration/ (分层编排，可选)
-            ├→ skills/ (Markdown Skills)
-            └→ mcp/ (工具注册)
-                 └→ tools/ (15 个核心工具)
-```
-
-**单向依赖**，无循环：`api → agent → orchestration → tools` / `mcp → tools`。
-
-### 2.3 包职责速览
-
-| 包 | 文件数 | 职责 |
-|---|---|---|
-| `api/` | 9 | Web & CLI 展示层：FastAPI 路由、WebSocket、A2UI、地图提取 |
-| `agent/` | 7 | Agent 装配层：工厂、上下文、模型适配、前置校验、NodeManager |
-| `tools/` | 19 | 核心工具：search (4) / planning (6) / rendering (2) / utility (2) |
-| `mcp/` | 6 | MCP 服务层：Server 创建、工具注册、适配器工厂、拦截器 |
-| `orchestration/` | 6 | 分层编排：策略、校验、度量、编排器、场景标签 |
-| `storage/` | 5 | 三层记忆：L1 压缩 / L2 ArtifactStore / L3 用户画像 |
-| `skills/` | 1 | Skills 热插拔 (skillkit) |
-| `utils/` | 3 | Prompt 模板引擎、日志 |
+这个变体默认关闭的原因：回滚后 LLM 可能做出相同决策再次失败，形成死锁。
 
 ---
 
-## 3. Agent 生命周期：从请求到响应
+### Q2 LangGraph 中的 State 怎么定义和流转？节点多了怎么防止状态膨胀？
 
-一次 WebSocket 请求的完整链路（`api/websocket_handler.py`）：
+**回答**：
 
-```
-用户输入 "帮我规划成都3天行程"
-  │
-  ▼ WebSocket 接收 → HumanMessage
-  │
-  ▼ context.precheck_user_request()
-  │   校验：意图？目的地？天数？→ 不合格则弹出 form_card
-  │
-  ▼ context.prepare_messages_for_invoke(messages)
-  │   ├── choose_memory_framework()  选择模式 (full/compressed/profile_only)
-  │   ├── L3: user_profile 提取偏好
-  │   ├── L1: memory_compressor 压缩早期消息（如需要）
-  │   └── build_dynamic_system_prompt()  注入 L2/L3
-  │
-  ▼ agent.ainvoke({"messages": invoke_messages})
-  │   └── LangGraph ReAct 循环 (最多 20 步)
-  │        ├── LLM 推理 → 决定调用 search_poi
-  │        ├── MCP Client → HTTP → MCP Server → search_poi → 高德API
-  │        ├── ArtifactStore.save_result() 持久化结果
-  │        ├── ToolMessage 写入消息历史
-  │        ├── LLM 推理 → 决定调用 check_weather
-  │        ├── LLM 推理 → 决定调用 smart_plan_itinerary
-  │        ├── LLM 推理 → 决定调用 render_itinerary
-  │        └── LLM 推理 → 输出最终文本回复
-  │
-  ▼ 后端加工 (api/map_extractor.py + api/a2ui_bridge.py)
-  │   ├── extract_map_blocks()    提取地图 JSON (itinerary/pois/route)
-  │   ├── extract_weather_block() 提取天气数据
-  │   └── extract_place_cards()   生成地点卡片
-  │
-  ▼ clean_messages_for_next_turn()  清理消息历史 (DeepSeek 兼容)
-  │
-  ▼ WebSocket 推送: 文本回复 + JSON 块 + A2UI 卡片
-  │
-  ▼ 前端解析渲染: 地图标记 + 行程卡片 + 天气组件
-```
+**状态定义**：项目使用 `create_react_agent` 预构建 Agent，它内部使用 `MessagesState`——一个带 `add_messages` reducer 的消息列表。Reducer 的作用是：多个节点写入同一字段时，消息是**追加**而非覆盖。
 
-**关键设计决策**：Agent 最多重试 1 次（超时 120s），ReAct 循环上限 20 步。LLM 自主决定调用哪些工具——不使用硬编码 `if-else` 调度。
+**状态流转**：Agent 图有 3 个核心节点：
+- `agent` 节点：调用 LLM，输出 AIMessage（可能含 tool_calls）
+- `tools` 节点：执行工具，输出 ToolMessage
+- 条件边：如果 LLM 返回 tool_calls → 路由到 tools；如果 LLM 返回纯文本 → 路由到 END
+
+每次状态变化是追加式的——AIMessage 追加到列表末尾，ToolMessage 再追加，LLM 始终能看到完整历史。
+
+**防止状态膨胀的 4 层机制**：
+
+第一层：`recursion_limit=20`。单次 Agent 推理最多走 20 轮 Agent→Tools 循环，超过 LangGraph 直接抛异常。
+
+第二层：L1 消息压缩。当消息数超过 24 条时，把早期消息（保留最近 10 条）交给 LLM 生成一段摘要，用摘要 SystemMessage 替换早期消息。这样消息列表长度不会无限增长。
+
+第三层：动态 System Prompt。每轮对话前重建 SystemMessage，不把它写回历史。历史中只保留 HumanMessage、AIMessage、ToolMessage，SystemMessage 每轮都是新的。
+
+第四层：硬阈值保护。当消息数超过 60 条或 token 估算超过 7000 时，关闭 L2（ArtifactStore 快照）注入，只保留 L3 用户偏好，进一步节省 token。
 
 ---
 
-## 4. Agent 装配：`build_agent()` 工厂模式
+### Q3 生产级 Agent 的执行循环包含哪些阶段？哪些必须显式状态化？
 
-位于 `agent/factory.py`，是项目中最重要的单一函数。
+**回答**：本项目的一次请求经历 7 个阶段，其中 4 个必须持久化状态：
 
-### 4.1 装配步骤
+**阶段 1：前置校验**
+- 做的事：检查用户输入是否有旅行意图、是否包含目的地、是否指定天数
+- 状态化：不需要——纯判断函数，无状态
 
-```python
-async def build_agent(cfg, session_id, *, lang="zh"):
-    # 1. 创建 LLM
-    llm = _build_llm(cfg)  # DeepSeek 或标准 ChatOpenAI
+**阶段 2：上下文构建**
+- 做的事：估算 token → 选记忆模式 → 可能压缩历史 → 提取用户偏好 → 拼装动态 System Prompt
+- 状态化：需要。messages 列表是累积的对话历史；L1 摘要写入 `summary.json`；L3 偏好写入 `user_profiles/default.json`
 
-    # 2. 通过 MCP Client 获取工具（不直接 import core_nodes）
-    client = MultiServerMCPClient(connections={...})
-    tools = await client.get_tools()
+**阶段 3：ReAct 循环**
+- 做的事：LLM 反复推理和调用工具，直到输出纯文本
+- 状态化：需要。LangGraph 内部维护 messages 状态列表，每次工具调用结果追加进去
 
-    # 3. 加载 Markdown Skills
-    skills_tools = await load_skills(skill_dir=".storyline/skills")
-    tools = tools + skills_tools
+**阶段 4：工具结果持久化**
+- 做的事：每次工具调用后，MCP 层自动把结果写入 `travel_outputs/<session_id>/` 目录树
+- 状态化：需要。每个工具调用结果存为独立 JSON 文件，`meta.json` 维护索引
 
-    # 4. 创建 ReAct Agent
-    agent = create_react_agent(model=llm, tools=tools, prompt=system_prompt)
+**阶段 5：结果提取**
+- 做的事：从 ToolMessage 中扫描地图数据、天气数据、地点卡片
+- 状态化：不需要——纯数据转换
 
-    # 5. 可选：包装分层编排
-    if cfg.orchestration.enabled:
-        agent = LayeredTravelAgent(llm=llm, tools_by_layer=..., ...)
+**阶段 6：历史清理**
+- 做的事：把消息列表中的 list/dict 类型 content 序列化为 string（DeepSeek 兼容）
+- 状态化：不需要——纯转换
 
-    # 6. 初始化三层记忆
-    compressor = MemoryCompressor(llm=llm, session_dir=...)
-    user_profile = UserProfileStore(...)
-    artifact_store = ArtifactStore(...)
+**阶段 7：响应推送**
+- 做的事：通过 WebSocket 发送回复文本 + 地图 JSON 块 + A2UI 卡片事件
+- 状态化：不需要——传输层
 
-    # 7. 创建运行时上下文
-    context = ClientContext(
-        cfg=cfg, session_id=session_id,
-        memory_compressor=compressor,
-        user_profile=user_profile,
-        artifact_store=artifact_store,
-        ...
-    )
-    return agent, context
-```
+---
 
-### 4.2 设计的工程含义
+### Q4 AgentState 的作用是什么？为什么不使用全局变量？
 
-| 设计 | 类比 Java |
+**回答**：LangGraph 的 AgentState 是贯穿整个图执行的共享数据容器。
+
+**本项目为什么不使用全局变量**：每个 WebSocket 连接有独立的 `messages = []` 列表。如果用全局变量，不同用户的数据会互相污染。AgentState 提供了额外的工程保障：
+
+1. **Reducer 语义**：`add_messages` reducer 确保多个节点写入同一字段时是追加而非覆盖——这很重要，因为 Agent 执行中 agent 节点和 tools 节点都要往 messages 里写东西
+2. **可回溯**：分层编排中利用 checkpoint 快照实现回滚——每层成功后 `list(messages)` 保存快照，失败时恢复到上一个成功点
+3. **可序列化**：状态可以被持久化到磁盘，支持跨进程恢复。项目虽未使用 LangGraph 的 SqliteSaver，但通过 ArtifactStore 实现了等效的工具结果持久化
+
+---
+
+### Q5 ReAct 循环中如何纠正逻辑塌缩或无效工具调用？
+
+**回答**：三层纠正策略：
+
+**第一层：System Prompt 引导**。System Prompt 中规定了推荐的 7 步工具调用顺序（先搜索景点→查天气→搜酒店→搜餐厅→智能规划→渲染→格式化），但不强制执行。
+
+**第二层：recursion_limit 硬性约束**。最多 20 轮循环，超过就抛异常，防止 LLM 无限循环。
+
+**第三层：后端兜底纠正（最关键）**。当 LLM 搜了景点但忘了调用 `smart_plan_itinerary` 或 `render_itinerary` 时，后端的地图提取模块会自动检测到"有搜索结果但没有行程块"，然后**后端直接调用** `smart_plan_itinerary` 算法，用搜索结果生成结构化行程并注入到回复中。用户完全无感知——即使 LLM "偷懒"，地图上也会展示完整的行程标注。
+
+分层编排模式还增加了额外的校验：每层执行后用 LayerValidator 检查该层是否调用了应该调用的工具类型，不通过就回滚重试。
+
+---
+
+### Q6 LangGraph 和 LangChain 的区别？分别适合什么场景？
+
+**回答**：本项目同时用了两者，职责分明：
+
+**LangChain 在本项目中的用途**：
+- 工具定义（`@tool` 装饰器把普通 Python 函数变成 LLM 可调用的 Tool）
+- 消息类型（`HumanMessage`、`AIMessage`、`ToolMessage`、`SystemMessage`）
+- LLM 接口封装（`ChatOpenAI` 统一了不同模型提供商的调用方式）
+
+**LangGraph 在本项目中的用途**：
+- 提供 ReAct 循环——"LLM 推理→工具调用→追加结果→LLM 再推理"这个循环，LangChain 的链式模型做不到
+- 状态管理——`MessagesState` + `add_messages` reducer 维护跨节点的消息列表
+- 条件路由——根据 LLM 是否返回 tool_calls 决定下一步走 tools 节点还是 END
+
+**适合场景**：LangChain 适合单次调用（"查一下天气"），LangGraph 适合需要多轮推理和工具调用的复杂任务（"帮我规划成都 3 天行程"）。
+
+---
+
+### Q7 如何限制 Agent 的思考深度、工具调用次数和递归层级？
+
+**回答**：四层限制：
+
+1. `recursion_limit=20`：LangGraph 在达到限制后抛异常，Agent 循环终止
+2. `asyncio.wait_for(timeout=120)`：单次请求 120 秒超时，防止挂死
+3. `MAX_RETRIES=1`：总共最多 2 次尝试（1 次正常 + 1 次重试）
+4. 记忆硬阈值：消息数 ≥ 60 或 token ≥ 7000 时关闭 L2 注入，节省 token 避免上下文爆炸
+
+分层编排中还有每层的重试上限：`max_retries_per_layer=1`，每层最多重试 1 次。
+
+---
+
+### Q8 LangGraph 的 State Snapshot 机制怎么实现？
+
+**回答**：本项目的分层编排中利用了 checkpoint 快照机制：
+
+- 执行开始前保存 `checkpoints["start"] = list(messages)` 作为初始快照
+- 每层校验通过后保存 `checkpoints[layer] = list(messages)`
+- 校验失败时恢复到上一个成功的 checkpoint：`messages = list(checkpoints[last_ok_key])`
+- 恢复后注入一条 HumanMessage："阶段 X 校验失败，请重试"，引导 LLM 改变决策路径
+
+普通 ReAct 模式不使用 LangGraph 的 SqliteSaver 持久化 checkpoint，而是通过 WebSocket 层的 `messages` 列表 + ArtifactStore 的工具结果持久化实现等效的跨轮次状态保持。
+
+---
+
+### Q9 你的项目有没有用到 ReAct 模式？怎么用的？
+
+**回答**：**是的，ReAct 是项目的唯一执行模式**。
+
+一次真实的"规划成都 3 天行程"的 ReAct 循环：
+
+1. LLM 收到用户请求 → 思考"需要搜索成都景点" → 调用 `search_poi`
+2. `search_poi` 返回 5 个 POI → 结果追加到消息历史
+3. LLM 看到结果 → 思考"还需要天气" → 调用 `check_weather`
+4. `check_weather` 返回 3 天预报 → 结果追加
+5. LLM 思考"信息够了，开始规划" → 调用 `smart_plan_itinerary`
+6. `smart_plan_itinerary` 返回结构化行程 → 结果追加
+7. LLM 思考"渲染到地图" → 调用 `render_itinerary`
+8. LLM 输出纯文本回复 → 循环结束
+
+整个过程 LLM 自主决定调用什么工具、何时调用、以什么顺序调用。System Prompt 只提供建议顺序，不强制执行。
+
+---
+
+## 二、工具管理与 MCP
+
+### Q10 MCP 协议的完整调用过程是怎样的？
+
+**回答**：4 个阶段：
+
+**阶段 1：服务启动**。FastAPI 启动时，`lifespan` 在后台启动 MCP Server（Uvicorn 监听 8002 端口）。MCP Server 创建时，一次性注册全部 17 个工具，同时初始化 SessionLifecycleManager（负责按 session_id 管理 ArtifactStore）。
+
+**阶段 2：工具发现**。每个 WebSocket 连接建立时，`build_agent()` 通过 `MultiServerMCPClient` 向 `http://127.0.0.1:8002/mcp` 发起 `tools/list` 请求，获取所有已注册工具的 JSON Schema。返回的 Tool 对象被合并到 Agent 的工具列表中。
+
+**阶段 3：工具调用**。LLM 决定调用工具时，LangGraph 通过 langchain-mcp-adapters 发起 HTTP POST 到 `/mcp`，Body 中包含 `{"method": "tools/call", "params": {"name": "search_poi", "arguments": {...}}}`。请求头携带 `X-Travel-Session-Id`，MCP Server 据此找到当前会话的 ArtifactStore。
+
+**阶段 4：结果回传**。MCP Server 执行工具后，返回统一信封：`{"artifact_id": "art_abc", "result": [...], "isError": false}`。LangGraph 将其包装为 ToolMessage 追加到消息历史。
+
+---
+
+### Q11 MCP Server 是怎么构建的？
+
+**回答**：3 步构建：
+
+1. **定义 session 生命周期**：通过 `@asynccontextmanager` 创建 lifespan，在 lifespan 中初始化 `SessionLifecycleManager`（管理 `session_id → ArtifactStore` 映射，自动清理过期会话）。lifespan 的返回值会作为 MCP 请求上下文注入到每个工具调用中。
+
+2. **创建 FastMCP 实例**：配置 server name（"travel"）、stateless_http（False——有状态，因为要按 session 隔离数据）、json_response（True）、lifespan。
+
+3. **注册工具**：调用 `register_tools.register()` 遍历 17 个工具，每个工具注册时声明参数签名（含 Annotated + Field description），FastMCP 自动生成 JSON Schema。
+
+**与普通 REST API 的关键区别**：MCP Server 的工具发现是自动的（`tools/list` 端点），Schema 从 Python 函数签名自动生成，调用通过统一端点路由而非每个工具独立 URL。
+
+---
+
+### Q12 MCP 和 Skills 的本质区别是什么？
+
+**回答**：项目同时使用两者，在不同层工作：
+
+**MCP** 是通信协议层——解决"工具如何被发现和调用"的问题。项目通过 MCP Server 暴露 17 个原子工具（`search_poi`、`check_weather` 等），Agent 通过 HTTP 发现和调用它们。
+
+**Skills** 是业务能力层——解决"如何描述多步骤工作流"的问题。项目有 4 个 Markdown 格式的 Skill（`full_trip_planner`、`hotel_recommender` 等），每个 Skill 描述了多步策略。例如 `full_trip_planner` 描述了 5 步流程：确认需求→搜索→规划→渲染→生成报告。
+
+LLM 看到的是：17 个 MCP 工具 + 4 个 Skill 工具。Skill 工具在 LLM 看来也是一个"工具"，但它内部包含了多步策略描述。LLM 可以调用 Skill（让系统自动执行 5 步）而不是手动逐个调用 5 个工具。
+
+**加载方式**：MCP 工具通过 HTTP 从 MCP Server 获取；Skills 从 `.storyline/skills/` 目录的 Markdown 文件加载，通过 `skillkit` 库转换为 LangChain Tool。
+
+---
+
+### Q13 工具描述写得再好，模型也瞎传参数怎么办？
+
+**回答**：三层防线：
+
+1. **MCP JSON Schema 自动校验**：FastMCP 根据函数的 `Annotated[str, Field(...)]` 声明自动生成 JSON Schema，类型不匹配会在 MCP 层被拦截。
+
+2. **默认值兜底**：所有可选参数都有默认值。比如 `max_results=5`、`budget_level="mid"`、`page_size=10`。LLM 不传这些参数也能正常工作。
+
+3. **业务容错**：Core Tool 内部做防御性处理。比如经纬度解析失败时不中断，只是该 POI 没有坐标；高德 API 返回空结果时返回 `[]` 而非报错；MCP 层捕获所有异常返回 `{"isError": true}` 而非崩溃。
+
+---
+
+### Q14 MCP 接入多个工具，返回格式不统一怎么处理？
+
+**回答**：统一信封 + 两层反序列化。
+
+**统一信封**：无论底层工具返回什么（list、dict、JSON string），MCP 层统一包装为 `{"artifact_id": "...", "result": ..., "isError": false}`。
+
+**两层反序列化**：消费端先解包 MCP 信封取出 `result`，再判断 `result` 是不是 JSON string——如果是（render 类工具返回的是 `json.dumps()` 的结果），再做第二次 `json.loads()`。
+
+这个设计确保了搜索工具返回的 POI 列表、规划工具返回的 dict、渲染工具返回的 JSON string 都能被消费端统一处理。
+
+---
+
+### Q15 你的 Agent 有哪些工具？工具是怎么设计的？
+
+**回答**：17 个工具按功能分为 4 类：
+
+**搜索类（4 个）**：`search_poi`、`search_hotel`、`search_restaurant`、`check_weather`。都调用高德 API，返回结构化数据（list/dict）。
+
+**规划类（6 个）**：`plan_itinerary`（简单均分）、`smart_plan_itinerary`（K-means 聚类+贪心排序，核心工具）、`plan_route`（驾车路线）、`estimate_budget`（预算估算）、`recommend_transport`（交通建议）、`format_itinerary`（LLM 生成 Markdown 报告）。
+
+**渲染类（2 个）**：`render_map_pois`、`render_map_route`、`render_itinerary`。不调外部 API，只做数据格式转换——把工具结果打包成前端可解析的 JSON 结构（含 `__type` 字段标记类型）。
+
+**横切类（2 个）**：`validate_json`、`fix_json`、`request_travel_info`（弹表单让用户补充信息）、`read_artifact`（读取之前工具调用的持久化结果）。
+
+**设计原则**：单一职责（每个工具只做一件事）、参数精简（可选参数有默认值）、输出结构化（返回 dict/list 而非自然语言）、渲染工具与业务工具分离（LLM 不关心数据打包细节）。
+
+---
+
+### Q16 工具多导致 token 数过多怎么解决？
+
+**回答**：项目不做动态工具加载（17 个工具对 LLM 全部可见），但通过两种机制控制：
+
+1. **分层编排（可选）**：启用后每层只暴露该层工具。research 层只有搜索+天气工具，planning 层只有规划工具，render 层只有渲染工具。每层 LLM 看到的工具列表大幅减少。
+
+2. **场景标签裁剪**：NodeManager 根据用户文本中的关键词识别场景（家庭/老人/情侣/穷游/豪华/长线等 11 种），然后过滤不相关的工具。比如用户说"穷游"，预算类工具保留但豪华酒店搜索被裁剪。
+
+---
+
+### Q17 多工具场景下怎么保证参数提取准确？
+
+**回答**：三个层面的保障：
+
+1. **MCP 层**：FastMCP 根据 Python 函数签名 + Field description 自动生成 JSON Schema，LLM 收到的 tool definition 包含每个参数的类型和描述，减少传错类型的概率。
+
+2. **默认值设计**：所有可选参数都有合理默认值（`max_results=5`、`budget_level="mid"`），LLM 不传也能正常工作。
+
+3. **Core Tool 容错**：搜索工具内部对高德 API 返回的异常数据做防御性处理（经纬度解析失败不影响其他字段、空结果返回 `[]` 不报错）。
+
+---
+
+## 三、记忆与上下文工程
+
+### Q18 会话记忆具体是怎么实现的？滑动窗口设几轮？摘要压缩怎么触发？
+
+**回答**：双层架构——Buffer + Summary。
+
+**Buffer**：保留最近 10 条消息不压缩，确保 LLM 能看到最近的对话上下文。
+
+**Summary**：当消息总数超过 24 条时触发压缩。把早期消息交给 LLM 生成一段摘要，用摘要 SystemMessage 替换早期消息。摘要持久化到 `session_dir/summary.json`，断线重连后可以恢复。
+
+**触发条件**：不是按轮次，而是按消息数量和 token 估算双阈值判断。软阈值 24 条消息或 3500 token → 触发 L1 压缩；硬阈值 60 条消息或 7000 token → 进一步关闭 L2 注入。
+
+---
+
+### Q19 讲一下 Agent 中的"长短期记忆"
+
+**回答**：项目实现了三层记忆，生命周期不同：
+
+**L1 短期记忆（MemoryCompressor）**：单 session 内有效。对话太长时，把早期消息压缩为 LLM 生成的摘要。摘要存在 `session_dir/summary.json`。
+
+**L2 中期记忆（ArtifactStore）**：单 session 内有效。每次工具调用的完整结果持久化到 `travel_outputs/<session_id>/` 目录树。每个工具调用一个 JSON 文件，`meta.json` 维护索引。通过 `build_context_prompt()` 将最新快照注入 System Prompt，让 LLM 知道"已经搜了什么、查了什么天气"。
+
+**L3 长期记忆（UserProfileStore）**：跨 session 有效。从用户消息中规则提取偏好（城市、预算、节奏），持久化到 `travel_data/user_profiles/default.json`。下次对话时自动注入 System Prompt。
+
+---
+
+### Q20 你怎么理解 Agent 里的"状态"而不是"上下文"？
+
+**回答**：
+
+**上下文**是 LLM 的输入——每轮对话前动态拼装的 System Prompt + 消息历史。变化方式：每轮重建 System Prompt，追加新消息。
+
+**状态**是系统的结构化数据——工具调用结果、用户偏好、对话摘要。变化方式：工具调用后写入 ArtifactStore，偏好提取后写入 UserProfileStore。
+
+关键区别：状态可以**不全部放进上下文**。项目通过 `build_dynamic_system_prompt()` 选择性地把状态快照注入 System Prompt——正常模式下注入 L2 快照 + L3 偏好，硬阈值模式下只注入 L3 偏好，关闭 L2 以节省 token。状态存在于文件系统中，不随上下文变化而丢失。
+
+---
+
+### Q21 长上下文里怎么让 Agent 不忘记关键信息？
+
+**回答**：通过 L2 ArtifactStore 的 System Prompt 注入机制。
+
+每轮对话前，`build_dynamic_system_prompt()` 会读取 ArtifactStore 的 `meta.json` 索引，生成一段"已收集数据"快照注入到 System Prompt 中。例如："已搜索 POI：宽窄巷子、锦里、武侯祠（5个结果）；已查天气：成都 3 天预报（晴 22°C）"。
+
+这意味着即使用户对话了 20 轮、L1 已经把早期消息压缩成摘要，LLM 依然能在 System Prompt 中看到"前期收集了什么数据"，不会因为上下文太长而忘记已经搜过什么。
+
+---
+
+### Q22 上下文窗口不够用怎么办？
+
+**回答**：三档策略：
+
+**正常模式**：全量上下文 + L2 快照 + L3 偏好。
+
+**压缩模式**（消息数 ≥ 24 或 token ≥ 3500）：L1 压缩早期消息为摘要，保留最近 10 条。L2 快照和 L3 偏好继续注入。
+
+**极限模式**（消息数 ≥ 60 或 token ≥ 7000）：L1 压缩 + 关闭 L2 注入（不再注入工具结果快照），只保留 L3 偏好。此时 LLM 看到的上下文最小——压缩后的历史 + 用户偏好，但不再有"已收集数据"快照。
+
+---
+
+### Q23 压缩过程中会丢失工具调用历史，导致模型重复调用工具怎么解决？
+
+**回答**：三个互补方案：
+
+1. **L2 注入不受 L1 压缩影响**。L2 快照是独立于消息历史的——它从文件系统读取，注入到 System Prompt。即使 L1 压缩了消息历史，System Prompt 中仍然有"已收集数据"快照。
+
+2. **L1 压缩只压缩对话文本**，不压缩工具调用结果。压缩 prompt 针对的是 HumanMessage 和 AIMessage 的文本内容。
+
+3. **后端兜底**。如果 LLM 确实忘了调用渲染工具，后端的地图提取模块会检测到"有搜索结果但无行程块"，直接调用 `smart_plan_itinerary` 生成行程并注入到回复中。
+
+---
+
+### Q24 什么是"工具态记忆"（Tool-state Memory）？
+
+**回答**：项目的 L2 ArtifactStore 就是工具态记忆。
+
+存储四类内容：
+- **工具调用结果**：`search_poi` 返回的完整 POI 列表
+- **调用元数据**：调用时间、tool name、artifact_id
+- **调用摘要**：如 "POI 搜索: 景点 @ 成都"
+- **引用索引**：`meta.json` 维护所有 artifact 的关系
+
+**作用**：避免 LLM 重复调用工具。System Prompt 中注入了"已搜索 POI: 5个结果"，LLM 知道不需要再搜一次。同时支持 `read_artifact` 工具，LLM 可以按 ID 读取之前工具调用的完整结果。
+
+---
+
+### Q25 如何设计三层记忆机制？
+
+**回答**：项目的三层记忆设计：
+
+**L1 — 滑动窗口 + LLM 摘要**。消息超过 24 条时，早期消息被 LLM 压缩为摘要，最近 10 条保留原文。摘要持久化到 `summary.json`。
+
+**L2 — 工具结果文件系统存储**。每次工具调用后自动写入 `travel_outputs/<session_id>/<tool_name>/<artifact_id>.json`。`meta.json` 维护索引。通过 `build_context_prompt()` 生成快照注入 System Prompt。
+
+**L3 — 跨 session 用户画像**。从消息中规则提取偏好（正则匹配城市名、预算关键词），持久化到 JSON 文件。下次对话自动注入 System Prompt。
+
+**协同工作**：每轮对话前，先选记忆模式（正常/压缩/极限），然后按模式决定是否触发 L1 压缩、是否注入 L2 快照、是否注入 L3 偏好。最终拼装为一个动态 System Prompt 发给 LLM。
+
+---
+
+## 四、容错与鲁棒性
+
+### Q26 如果 Agent 的决策出错了，怎么防范？
+
+**回答**：四层防范：
+
+**前置校验**：检查用户输入是否有旅行意图、是否包含目的地和天数。缺失则弹出表单让用户补充，而非让 LLM 瞎猜。
+
+**执行中约束**：recursion_limit=20 防止死循环，timeout=120s 防止卡死，MAX_RETRIES=1 防止无限重试。
+
+**执行后兜底**：LLM 搜了景点但忘了调规划/渲染工具时，后端直接调用算法生成行程并注入回复。用户无感知。
+
+**分层编排校验**：每层执行后检查该层是否调用了应该调用的工具类型，不通过则回滚重试。
+
+---
+
+### Q27 Agent 如何减少幻觉？
+
+**回答**：旅行场景的幻觉治理：
+
+**生成前**：System Prompt 明确要求"必须先调用工具获取真实数据，不得凭空编造地点信息"。
+
+**生成中**：所有地点信息来自高德 API 返回值（经纬度、名称、地址），不是 LLM 的 parametric knowledge。LLM 只能基于 tool result 做加工和排版，不能"想象"一个不存在的景点。
+
+**生成后**：后端兜底——即使 LLM 没输出完整结果，地图提取模块会自动生成 itinerary 块，确保用户总能看到地图标注。
+
+---
+
+### Q28 上下文爆炸或工具循环调用怎么解决？
+
+**回答**：五个机制协同：
+
+1. `recursion_limit=20`——硬性限制循环步数
+2. `asyncio.wait_for(timeout=120)`——超时终止
+3. L1 压缩——消息超过 24 条时压缩早期消息
+4. 硬阈值——消息超过 60 条时关闭 L2 注入
+5. 去重——地图提取时按城市+天数去重，相同行程只保留最新版本
+
+---
+
+### Q29 Agent 系统的 fallback 是怎么做的？
+
+**回答**：四级 fallback：
+
+**工具级**：高德 API 失败 → 返回空列表不抛异常；MCP 层异常捕获 → 返回 `{"isError": true}`。
+
+**编排级**：Skill 加载失败 → 记录 warning 继续运行；分层编排包装失败 → 回退到标准 ReAct。
+
+**请求级**：超时或异常 → 重试 1 次；全部失败 → 发送错误消息给用户。
+
+**输出级**：LLM 忘调渲染工具 → 后端直接调用规划算法生成行程。
+
+---
+
+### Q30 执行到一半工具调超时了 Agent 怎么处理？
+
+**回答**：外层 `asyncio.wait_for(timeout=120)` 超时后抛出 `TimeoutError`，WebSocket 层捕获后向用户发送"请求超时，正在重试"提示，然后用相同的 `invoke_messages` 重试一次。重试不会丢失上下文——`invoke_messages` 在超时前已经构建好，保持不变。
+
+---
+
+### Q31 Agent 用状态机编排时卡死/死循环怎么排查和熔断？
+
+**回答**：分层编排有两层熔断：
+
+**层内熔断**：每层最多重试 `max_retries_per_layer` 次（默认 1 次），超过则停止该层。
+
+**全局熔断**：某层失败后整个管线停止（`break`），不再继续后续层。
+
+再加 WebSocket 层的 120s 超时——即使分层编排内部卡死，外层也会超时终止。
+
+---
+
+### Q32 Agent 做多轮工具调用和单轮相比有哪些额外挑战？
+
+**回答**：5 个挑战及对应解法：
+
+| 挑战 | 解法 |
 |---|---|
-| `build_agent()` | `@Configuration` + `@Bean` 方法（Spring 的 ApplicationContext 装配） |
-| `ClientContext` | `@RequestScope` Bean —— 每个会话独立，不跨连接共享 |
-| 通过 MCP Client 获取工具 | 服务发现：Agent 不直接依赖工具实现，通过 HTTP 发现 |
-| Skills 热插拔 | 插件系统：新增 `SKILL.md` 重启后自动生效 |
+| 错误累积 | 单轮失败返回 isError 而非中断 |
+| 上下文膨胀 | L1 压缩 + 硬阈值 |
+| 依赖管理 | System Prompt 建议的 7 步顺序 |
+| 状态一致性 | L2 快照注入确保 LLM 知道已收集数据 |
+| 延迟叠加 | 异步调用 + 120s 全局超时 |
 
 ---
 
-## 5. 模型适配层：DeepSeekChatOpenAI
+## 五、架构设计与工程实践
 
-位于 `agent/deepseek_adapter.py`。
+### Q33 Agent 的架构设计？从系统角度来拆分
 
-**问题**：DeepSeek API 不接受 `content: [...]`（list 类型），要求 `content: "string"`。标准 LangChain 在某些消息中会生成 list 类型的 content。
+**回答**：按系统职责分为 5 层：
 
-**解决方案**：`DeepSeekChatOpenAI(ChatOpenAI)` 子类覆盖 `_get_request_payload()`：
+**展示层（api/）**：FastAPI 路由、WebSocket 通信、A2UI 卡片生成、地图数据提取、消息序列化。
 
-```python
-class DeepSeekChatOpenAI(ChatOpenAI):
-    def _get_request_payload(self, input_, *, stop=None, **kwargs):
-        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        # 1. 将所有 content 拍平为 string
-        # 2. 回注 reasoning_content (DeepSeek thinking 模式)
-        for msg in payload["messages"]:
-            if not isinstance(msg["content"], str):
-                msg["content"] = _flatten_content(msg["content"])
-        return payload
-```
+**编排层（agent/ + orchestration/）**：Agent 工厂装配、会话上下文管理、分层编排、工具元数据管理。
 
-**两层保障**：
-- 发送前：`DeepSeekChatOpenAI._get_request_payload()` 拍平 content
-- 接收后：`message_utils.clean_messages_for_next_turn()` 序列化历史消息
+**协议层（mcp/）**：MCP Server、工具注册、适配器工厂、拦截器。
+
+**领域层（tools/）**：17 个核心工具，按 search / planning / rendering / utility 四个子领域组织。
+
+**基础设施层（storage/ + utils/ + config.py）**：三层记忆、Prompt 模板引擎、配置管理。
+
+依赖方向：`api → agent → orchestration → tools` / `mcp → tools`。基础设施层被所有上层依赖。
 
 ---
 
-## 6. ReAct Agent 机制
+### Q34 模型和 Agent 的区别到底是什么？
 
-### 6.1 什么是 ReAct
+**回答**：在本项目中，模型是一个**函数**——接收消息列表，返回文本。Agent 是一个**系统**——在模型外面包了一层循环：模型输出 tool_calls → 执行工具 → 结果追加到上下文 → 模型再次推理 → ... 直到输出纯文本。
 
-ReAct (Reasoning + Acting) 是一种 Agent 范式：LLM 在思考后自主决定调用工具，观察工具结果后再决定下一步：
-
-```
-System: "你是一个旅行助手，可用工具: search_poi, check_weather, ..."
-User: "帮我规划成都3天行程"
-
-→ LLM 思考: 需要搜索成都景点
-→ ToolCall: search_poi(city="成都", keyword="景点")
-→ ToolResult: [{name: "宽窄巷子", ...}, ...]
-
-→ LLM 思考: 已有景点，还需要天气
-→ ToolCall: check_weather(city="成都", forecast=True)
-→ ToolResult: {days: [{date: "...", weather: "晴"}, ...]}
-
-→ LLM 思考: 信息足够，规划行程
-→ ToolCall: smart_plan_itinerary(spots=..., hotels=..., days=3, ...)
-→ ToolResult: {days: [{label: "第1天", spots: [...]}, ...]}
-
-→ LLM 思考: 渲染到地图
-→ ToolCall: render_itinerary(days=..., city="成都")
-
-→ LLM 输出: "为您规划了成都3日行程：第一天..."
-```
-
-### 6.2 LangGraph 实现
-
-项目使用 `langgraph.prebuilt.create_react_agent()`，它内部维护一个消息列表循环：
-
-1. 将当前消息列表发给 LLM
-2. 如果 LLM 返回 `tool_calls`，调用工具并追加 ToolMessage
-3. 重复直到 LLM 返回纯文本（无 tool_calls）
-4. `recursion_limit=20` 防止死循环
-
-### 6.3 为什么可能重复调用工具
-
-这不是 Bug，是 ReAct 的特性。LLM 可能在收到工具结果后发现信息不足，再次调用同一工具。去重策略在消费端（`map_extractor.py` 的 `_seen_itinerary_keys` / `_seen_pois_keys`），而非在 Agent 执行时拦截。
+项目中的体现：`_build_llm()` 创建的是一个 ChatOpenAI 实例（模型），`create_react_agent(model=llm, tools=tools)` 把它包装成一个能自主调用工具的 Agent。模型本身不知道工具的存在，是 Agent 框架赋予了它这个能力。
 
 ---
 
-## 7. 工具工程：分层工具设计
+### Q35 Agent 系统里模型和系统代码的职责边界怎么划？
 
-### 7.1 工具分类
+**回答**：
 
-所有 16 个核心工具按领域分为 4 个子包：
+| 模型负责 | 系统代码负责 |
+|---|---|
+| 决定调用哪个工具 | 工具 Schema 校验、工具执行 |
+| 推断工具参数 | 结果持久化（ArtifactStore） |
+| 生成回复文本 | 地图数据提取、A2UI 卡片生成 |
+| — | 上下文压缩策略（何时压缩、阈值判断） |
+| — | 重试/超时/熔断 |
 
-```
-tools/
-├── search/        外部 API 调用
-│   ├── search_poi.py         高德关键字搜索
-│   ├── search_hotel.py       酒店搜索 (支持 budget_level)
-│   ├── search_restaurant.py  餐厅搜索 (支持菜系)
-│   └── check_weather.py      高德天气查询
-│
-├── planning/      算法 + LLM 加工
-│   ├── plan_itinerary.py         简单均分版
-│   ├── smart_plan_itinerary.py   K-means 聚类 + 贪心路径 (核心)
-│   ├── plan_route.py            驾车路线规划
-│   ├── estimate_budget.py       预算估算
-│   ├── recommend_transport.py   交通方式建议
-│   └── format_itinerary.py      LLM 生成 Markdown 报告
-│
-├── rendering/     纯数据格式转换 (不调 API)
-│   ├── render_map.py   POI 标记 + 路线折线 → 前端 JSON
-│   └── render_itinerary.py  行程 → 有序标记 JSON
-│
-└── utility/       横切工具
-    ├── json_tools.py          JSON 校验 + LLM 修复
-    └── request_travel_info.py 信息补充表单触发
-```
-
-### 7.2 工具定义范式
-
-所有工具使用 LangChain `@tool` 装饰器：
-
-```python
-from langchain_core.tools import tool
-
-@tool("search_poi", return_direct=False)
-async def search_poi_tool(
-    keyword: str,
-    city: Optional[str] = None,
-    category: Optional[str] = None,
-    page_size: int = 10,
-) -> List[Dict[str, Any]]:
-    """搜索指定城市内的旅游相关 POI。"""  # ← 这个 docstring 就是 LLM 看到的 Tool Description
-    cfg = load_settings(default_config_path())
-    pois = await _amap_place_text_search(keyword=keyword, api_key=cfg.map.api_key, ...)
-    return [{"name": p.get("name"), "longitude": ..., "latitude": ..., ...} for p in pois]
-```
-
-**关键点**：`@tool` 的 docstring 直接作为 LLM 的 Tool Description。描述的质量直接影响 LLM 的工具选择准确率。
-
-### 7.3 渲染工具 vs 搜索工具
-
-**搜索工具**调用外部 API，属于领域逻辑层。
-**渲染工具**只做数据格式转换（`dict → JSON string`），属于展示层。
-
-分离原因：LLM 不应被"数据打包"细节干扰思考，搜索和规划完成后才渲染。这也使得在前端离线测试时可以直接 mock 渲染输出。
-
-### 7.4 `smart_plan_itinerary` — 核心算法
-
-```
-输入: spots[], hotels[], restaurants[], days, city, pace, weather_summary
-处理:
-  1. K-means 风格迭代聚类 (Haversine 球面距离，最多 10 轮)
-  2. 按 pace 控制每天景点数 (relaxed=2/standard=3/intensive=4)
-  3. 雨天识别 (正则提取 + 室内优先)
-  4. 贪心最近邻排序减少迂回
-  5. 跨天去重 + 循环分配酒店和餐厅
-输出: {city, title, days: [{label, spots: [{name, lng, lat, note}], hotel, meals}]}
-```
+**核心原则**：模型只负责理解和决策，系统代码负责执行和保障。
 
 ---
 
-## 8. MCP 协议层：工具发现与调用
+### Q36 为什么很多团队做 Workflow + Agent 混合架构？
 
-### 8.1 为什么需要 MCP
+**回答**：项目的分层编排就是混合架构的一个实例。
 
-MCP (Model Context Protocol) 在本项目中扮演双重角色：
-1. **内部工具调用的统一通道**：Agent 不直接 `import` 工具函数，而是通过 HTTP 调用
-2. **对外暴露工具**：外部 MCP 客户端（如 Claude Desktop）可直接连接使用
+不同环节对确定性的要求不同：前置校验（检查用户是否说了目的地）可以完全确定——用规则 if-else。工具调用顺序（先搜景点还是先查天气）无法穷举——交给 LLM 自主决策。
 
-### 8.2 调用链路
-
-```
-LLM ToolCall "search_poi"
-  → LangGraph MCP Tool (langchain-mcp-adapters)
-  → HTTP POST http://127.0.0.1:8002/mcp
-      Headers: {"X-Travel-Session-Id": "travel_xxx"}
-  → FastMCP Server
-  → register_tools.py: mcp_search_poi()
-  → _execute_tool("search_poi", ctx, cfg, invoke_args)
-       ├── adapters._import_tool("search_poi") → 延迟导入 core tool
-       ├── core_tool.ainvoke(args) → 高德 API
-       └── store.save_result() → 持久化到 ArtifactStore
-  → 返回 MCP 信封: {artifact_id, result, isError}
-```
-
-### 8.3 工具注册（工厂模式消除模板）
-
-重构前，`register_tools.py` 有 15 个几乎完全相同的 `@server.tool()` 块（~25KB）。重构后：
-
-```python
-# 每个工具只需声明参数签名 + 委托到共享执行体
-@server.tool(name="search_poi", description="...")
-async def mcp_search_poi(ctx, city, keyword, types=None, max_results=5):
-    return await _execute_tool("search_poi", ctx, cfg, {"city": city, ...})
-```
-
-共享执行体 `_execute_tool()` 统一处理：**延迟导入 → 调用 → save_result → 返回信封**。
-
-### 8.4 会话隔离
-
-每个工具调用携带 `X-Travel-Session-Id` 请求头，`adapters._get_store(ctx, cfg)` 通过 `SessionLifecycleManager` 获取该会话的 `ArtifactStore`，确保不同用户的搜索、天气和行程结果互不污染。
+分层编排更进一步：每层有工具白名单（确定性），但层内 LLM 自由选择调用哪个工具（灵活性）。research 层必须触发搜索工具（确定性约束），但具体搜什么、用什么关键词由 LLM 决定（灵活性）。
 
 ---
 
-## 9. 上下文工程与三层记忆
+### Q37 什么时候该做 Agent？和 Workflow 的边界在哪？
 
-### 9.1 什么是上下文工程
+**回答**：判断标准是决策路径是否可穷举。
 
-Agent 的"上下文" = System Prompt + 消息历史 + 记忆注入。`ClientContext.prepare_messages_for_invoke()` 是上下文的统一装配入口。
+项目中 Workflow 做的事：前置校验——4 种缺失场景（太短/无意图/无目的地/无天数）可以穷举，用 if-else 处理。
 
-### 9.2 动态上下文构建流程
+Agent 做的事：工具调用顺序和参数选择——用户可能先说"推荐酒店"再补"还要景点"，也可能直接说"成都 3 天亲子游"，LLM 自主决定搜索策略。
 
-```python
-async def prepare_messages_for_invoke(self, messages):
-    # 1. 估算 token → 选择记忆模式
-    mode, reason = choose_memory_framework(
-        message_count=len(messages),
-        token_estimate=...,
-        soft_threshold=24/3500,   # 达到即触发 L1 压缩
-        hard_threshold=60/7000,   # 达到即关闭 L2，仅保留 L3
-    )
-
-    # 2. L3: 用户偏好提取 (轻量规则)
-    self.user_profile.extract_preferences_from_messages(messages)
-
-    # 3. L1: 消息压缩 (如果触发阈值)
-    if mode in {"compressed_context", "profile_only"}:
-        messages = await self.memory_compressor.maybe_compress(messages)
-
-    # 4. 动态拼装 system prompt
-    dynamic_prompt = self.build_dynamic_system_prompt(store=...)
-    return [SystemMessage(content=dynamic_prompt)] + messages
-```
-
-### 9.3 三层记忆架构
-
-| 层级 | 组件 | 文件 | 生命周期 | 注入方式 |
-|---|---|---|---|---|
-| **L1** | `MemoryCompressor` | `storage/memory_compressor.py` | 单 session | LLM 摘要压缩早期消息 → `SystemMessage` |
-| **L2** | `ArtifactStore` | `storage/agent_memory.py` | 单 session | `build_context_prompt()` 快照注入 system prompt |
-| **L3** | `UserProfileStore` | `storage/user_profile.py` | 跨 session | 规则提取偏好 → system prompt 前缀 |
-
-### 9.4 动态 System Prompt 结构
-
-```
-┌──────────────────────────────────────────┐
-│ 原始 system prompt (指令 + 工具说明)       │  ← prompts/tasks/instruction/zh/system.md
-├──────────────────────────────────────────┤
-│ L3: 用户偏好    "用户偏好城市：成都、杭州"   │  ← UserProfileStore.build_profile_prompt()
-│                  "预算：mid"               │
-│                  "节奏：standard"          │
-├──────────────────────────────────────────┤
-│ L2: 工具快照    "已搜索 POI (5个):          │  ← ArtifactStore.build_context_prompt()
-│                   宽窄巷子, 锦里, ..."      │
-│                  "已查天气: 晴 22°C"       │
-└──────────────────────────────────────────┘
-```
-
-### 9.5 memory_switch 策略
-
-```toml
-[memory_switch]
-enabled = true
-soft_message_threshold = 24    # 24 条消息 → 触发 L1 压缩
-hard_message_threshold = 60    # 60 条消息 → 关闭 L2，仅保留 L3
-soft_token_threshold = 3500
-hard_token_threshold = 7000
-```
-
-三档模式：`full_context` → `compressed_context` → `profile_only`。目的是在上下文窗口限制下保住最关键信息。
+混合做的事：兜底策略——LLM 忘调渲染工具时，后端用确定性代码补救。
 
 ---
 
-## 10. 分层编排（可选特性）
+### Q38 开发 Agent 时踩过什么坑？
 
-位于 `orchestration/`，默认关闭（`config.toml` 中 `[orchestration].enabled = false`）。
+**回答**：5 个关键坑：
 
-### 10.1 五层流水线
+1. **DeepSeek 不接受 list 类型 content**：需要两层拍平——发送前在 `DeepSeekChatOpenAI._get_request_payload()` 中拍平，接收后在消息历史清理中再次拍平。
 
-```
-requirement → research → planning → risk → render
-  需求确认      搜索/天气    规划/编排    风险校验   渲染输出
-```
+2. **分层编排死锁**：回滚后 LLM 做出相同决策再次失败。解决：默认关闭分层编排。
 
-每层只暴露该层的工具白名单（由 `NodeManager` 管理）。`LayerValidator` 做最小校验（research 层必须触发搜索工具，planning 层必须触发编排工具）。失败时回滚到最近 checkpoint 重试。
+3. **ReAct 循环无上限**：没传 `recursion_limit` 时默认 25，LLM 可能循环到死。解决：显式传入 `recursion_limit=20`。
 
-### 10.2 与自由 ReAct 的对比
+4. **reasoning_content 丢失**：DeepSeek thinking 模式要求回传 reasoning_content，但父类 ChatOpenAI 会丢弃它。解决：在子类中手动回注。
 
-| 维度 | 自由 ReAct | 分层编排 |
-|---|---|---|
-| 工具选择 | LLM 自由决定 | 每层白名单限制 |
-| 执行保证 | 依赖 prompt 提示 | LayerValidator 强制校验 |
-| 失败处理 | 继续或卡死 | 回滚 + 重试 |
-| 成本 | 低延迟 | 每层额外 LLM 调用 |
-
-当前默认关闭是因为回滚时状态等价性导致偶发死锁，适合作为学习分层 Agent 架构的参考实现。
-
-### 10.3 场景标签（消除代码重复）
-
-`orchestration/scenario_tags.py` 提供 `infer_scenario_tags()` 函数，从用户文本中识别 11 种场景标签（family/senior/couple/solo/budget/luxury/outdoor/culture/short_trip/long_trip/custom）。该函数同时被 `LayeredTravelAgent` 和 `NodeManager` 使用——这就是为什么它被提取到 `orchestration/` 包中而不是放在某个调用方内。
+5. **MCP 信封两层反序列化**：render 工具返回 JSON string，外面又包了 MCP 信封 `{artifact_id, result}`。需要两次 `json.loads()`。
 
 ---
 
-## 11. 前端数据协议与输出投射
+### Q39 Agent 的成本怎么控制？
 
-### 11.1 JSON 块协议
+**回答**：
 
-后端将地图/天气数据以 markdown 代码块形式附加到 LLM 回复末尾：
-
-````markdown
-助手: 为您规划了成都3日行程...
-
-```json
-{"__type": "itinerary", "city": "成都", "title": "...", "days": [...]}
-```
-
-```json
-{"__type": "weather", "city": "成都", "days": [{...}]}
-```
-````
-
-前端 `web/static/app.js` 通过正则提取 `__type` 字段进行渲染：
-
-| `__type` | 来源工具 | 前端渲染 |
-|---|---|---|
-| `pois` | `render_map_pois` / search 兜底 | 标记点 |
-| `itinerary` | `render_itinerary` / `smart_plan_itinerary` | 分组标记 + 连线 + 卡片 |
-| `route` | `render_map_route` / `plan_route` | 折线 |
-| `weather` | `check_weather` | 天气组件 |
-
-### 11.2 兜底机制
-
-`map_extractor.py` 中的 `extract_map_blocks()` 包含一个关键兜底逻辑：当 LLM 做了搜索（`search_poi`）但忘了调用 `smart_plan_itinerary` 或 `render_itinerary` 时，后端会自动用搜索结果构建一个 `itinerary` 块。这解决了 LLM 工具调用不完整的常见问题。
-
-### 11.3 输出加工流水线
-
-```
-Agent 原始输出
-  │
-  ▼ api/message_utils.normalize_content()   序列化 content
-  ▼ api/map_extractor.extract_map_blocks()   提取地图 JSON
-  ▼ api/map_extractor.extract_weather_block() 提取天气 JSON
-  ▼ api/a2ui_bridge.extract_place_cards()    生成地点卡片
-  ▼ api/message_utils.clean_messages_for_next_turn()  清理历史
-  │
-  ▼ WebSocket 推送 → 前端渲染
-```
-
----
-
-## 12. 设计模式总结
-
-| 模式 | 体现位置 | 作用 |
-|---|---|---|
-| **Factory** | `agent/factory.py` — `build_agent()` | 一站式装配 LLM + Tools + Memory + Context |
-| **Request Scope** | `agent/context.py` — `ClientContext` | 每会话独立的运行时上下文 |
-| **Facade** | `mcp/` — FastMCP Server | 统一工具调用入口 |
-| **Adapter** | `agent/deepseek_adapter.py` / `mcp/adapters.py` | 协议适配 (DeepSeek / MCP) |
-| **Strategy** | `agent/memory_switch.py` — `choose_memory_framework()` | 三套记忆模式动态切换 |
-| **Repository** | `storage/agent_memory.py` — `ArtifactStore` | 工具结果持久化 |
-| **Template Method** | `utils/prompts.py` — `PromptBuilder` | Markdown 模板 + `{{variable}}` 替换 |
-| **Plugin** | `skills/skills_io.py` | Skills 热插拔 |
-| **Pipeline** | `orchestration/layered_agent.py` | 五层流水线编排 |
-
-### 工程实践建议
-
-1. **工具签名即契约**：Tool 的 docstring 是 LLM 的 API 文档，改签名要同步更新 description
-2. **延迟导入**：MCP 工具通过 `_import_tool()` 延迟导入，避免模块级循环依赖
-3. **去重在消费端**：不在 Agent 执行时拦截重复调用，而在 `map_extractor` 中按 key 去重
-4. **DeepSeek 兼容**：两处 content 拍平（发送前 + 历史清理），新增模型时先检查能否接受 list content
-5. **config.toml 是唯一配置源**：Pydantic `extra="forbid"` 防止拼写错误，相对路径以配置文件目录为基准
+1. `recursion_limit=20`——限制单次请求的 LLM 调用次数
+2. L1 压缩——消息超过 24 条时压缩，减少每轮的 token 消耗
+3. 硬阈值关闭 L2——消息超过 60 条时不再注入工具结果快照
+4. 单 worker 部署——每个容器只运行一个 FastAPI worker（因为 MCP Server 绑定端口 8002）
+5. L2 快照注入——让 LLM 知道"已经搜过了"，减少重复工具调用

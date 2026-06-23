@@ -64,7 +64,7 @@
 └─────────│───────────────────│──────────┘
           │ HTTP SSE / REST    │ AMap JS SDK
 ┌─────────▼────────────────────────────────┐
-│           FastAPI  (api/server.py)       │
+│           FastAPI  (agent_fastapi.py)    │
 │  ┌────────────────────────────────────┐  │
 │  │   LangGraph ReAct Agent           │  │
 │  │   ┌──────────┐  ┌──────────────┐  │  │
@@ -91,8 +91,8 @@
 
 ```
 travel/
-├── run_server.py                 # Web 服务启动器
-├── run_cli.py                    # CLI 启动器
+├── agent_fastapi.py              # FastAPI 服务入口（含 SSE 流式推送）
+├── cli.py                        # 命令行交互入口
 ├── build_env.sh                  # 一键创建 uv 虚拟环境脚本
 ├── config.toml                   # ⚠️ 含 API Key，已加入 .gitignore，请勿提交
 ├── config.toml.example           # 配置模板，复制此文件并填写 Key
@@ -171,7 +171,7 @@ travel/
 ### 整体请求流程
 
 ```
-uv run python run_server.py
+uv run uvicorn agent_fastapi:app
         │
         ├─ FastAPI lifespan 启动
         │   └─ asyncio.create_task(_run_mcp_server)
@@ -355,8 +355,8 @@ python scripts/eval_layer_metrics.py --outputs-dir travel_outputs --out-dir trav
 **影响**：在 thinking 模式下，**每次 API 调用都会失败**（400: `The reasoning_content in the thinking mode must be passed back to the API`），分层编排的重试机制会让失败重复发生，用户看到的是超时或空响应。
 
 **修复位置**：
-- `src/travel_agent/agent/deepseek_adapter.py` — `DeepSeekChatOpenAI._get_request_payload()` 在父类序列化后，从原始消息中提取 `reasoning_content` 并回注
-- `src/travel_agent/api/message_utils.py` — `clean_messages_for_next_turn()` 在重建 `AIMessage` 对象时保留 `reasoning_content`
+- `src/travel_agent/agent.py:132-144` — `DeepSeekChatOpenAI._get_request_payload()` 在父类序列化后，从原始消息中提取 `reasoning_content` 并回注到对应的 assistant 消息体中
+- `agent_fastapi.py:64-76` — `_clean_messages_for_next_turn()` 在重建 `AIMessage` 对象时保留 `reasoning_content`
 
 **规避方案**：如使用非 thinking 模型（标准 `deepseek-chat` 且不传 `reasoning_effort` 参数），此问题不会触发。但本项目的修复已确保两种模式都能正常工作。
 
@@ -370,11 +370,11 @@ python scripts/eval_layer_metrics.py --outputs-dir travel_outputs --out-dir trav
 
 #### 3. ReAct 循环无上限导致卡死
 
-**问题**：`api/websocket_handler.py` 调用 `agent.ainvoke()` 时**未传入 `config` 参数**，LangGraph 使用默认递归限制（25 步）。在 LLM 出错、工具返回异常数据等边界情况下，Agent 可能陷入反复调用工具的循环，消耗完 25 步后才停止，期间用户等待长达 120 秒超时。
+**问题**：`agent_fastapi.py` 调用 `agent.ainvoke()` 时**未传入 `config` 参数**，LangGraph 使用默认递归限制（25 步）。在 LLM 出错、工具返回异常数据等边界情况下，Agent 可能陷入反复调用工具的循环，消耗完 25 步后才停止，期间用户等待长达 120 秒超时。
 
 **修复**：
-- `api/websocket_handler.py` — 新增 `AGENT_RECURSION_LIMIT = 20`，在 `ainvoke` 时显式传入 `config={"recursion_limit": 20}`
-- `api/cli.py` — 修复原有 config 中的**拼写错误**（`" configurable"` → `"configurable"`，多余空格导致整个 config 不生效），同时加入 `recursion_limit`
+- `agent_fastapi.py:89` — 新增 `AGENT_RECURSION_LIMIT = 20`，在 `ainvoke` 时显式传入 `config={"recursion_limit": 20}`
+- `cli.py:61` — 修复原有 config 中的**拼写错误**（`" configurable"` → `"configurable"`，多余空格导致整个 config 不生效），同时加入 `recursion_limit`
 - 将 `MAX_RETRIES` 从 2 降为 1，避免用户等待过久
 
 #### 4. 会话持久化重构
@@ -403,12 +403,12 @@ python scripts/eval_layer_metrics.py --outputs-dir travel_outputs --out-dir trav
 
 #### 层 1：对话上下文记忆（LangGraph 消息历史）
 
-LangGraph ReAct agent 维护完整的 `messages` 列表。`api/websocket_handler.py` 在每次请求时将历史消息传入，LLM 可感知整个对话上下文：
+LangGraph ReAct agent 维护完整的 `messages` 列表，包含每轮的 `HumanMessage`、`AIMessage`、`ToolMessage`。`agent_fastapi.py` 在每次请求时将历史消息传入，LLM 可感知整个对话上下文：
 
 ```python
-# api/message_utils.py
-clean_messages_for_next_turn(messages)   # 将 list/dict content 序列化为 string
-                                          # （DeepSeek API 要求 content 必须是 string）
+# agent_fastapi.py
+_clean_messages_for_next_turn(messages)   # 将 list/dict content 序列化为 string
+                                           # （DeepSeek API 要求 content 必须是 string）
 await agent.ainvoke({"messages": messages})
 ```
 
@@ -497,10 +497,10 @@ Agent 内置 **MCP（Model Context Protocol）服务层**，在本项目中承�
 
 **2. 对外暴露工具**：支持 Claude Desktop、Cursor 等 MCP 兼容客户端直接连接 `http://127.0.0.1:8002/mcp` 使用全部旅行工具。
 
-**启动方式**：无需手动启动，`python run_server.py` 时由 FastAPI `lifespan` 自动在后台拉起 MCP Server：
+**启动方式**：无需手动启动，`uvicorn agent_fastapi:app` 时由 FastAPI `lifespan` 自动在后台拉起 MCP Server：
 
 ```python
-# api/server.py
+# agent_fastapi.py
 @asynccontextmanager
 async def lifespan(app):
     asyncio.create_task(_run_mcp_server(cfg))  # 后台启动 MCP Server（端口 8002）
@@ -825,7 +825,7 @@ uv pip install -r requirements.txt
 ### 4. 启动服务
 
 ```bash
-uv run python run_server.py
+uv run uvicorn agent_fastapi:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 打开浏览器访问 **[http://localhost:8000](http://localhost:8000)**，即可开始对话规划行程。
@@ -853,7 +853,7 @@ uv run python run_server.py
 不启动 Web 服务时，也可以直接命令行对话：
 
 ```bash
-uv run python run_cli.py
+uv run python cli.py
 ```
 
 ---
@@ -894,6 +894,18 @@ docker compose down
 `config.toml` 只读挂载到容器，不会进入镜像。`travel_data/`、
 `travel_outputs/` 和 `.travel/` 会保留在本机。当前架构必须使用单个
 Uvicorn worker，因为每个 Web worker 都会启动同一个 MCP `8002` 端口。
+
+### 云服务器 + 域名 HTTPS
+
+项目已提供 Caddy 反向代理和自动 HTTPS 配置：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填写已解析到服务器公网 IP 的 DOMAIN
+docker compose -f compose.yaml -f compose.prod.yaml up -d --build
+```
+
+完整步骤见 [最小生产 Demo 部署文档](docs/MINIMAL_DEPLOYMENT.md)。
 
 ---
 

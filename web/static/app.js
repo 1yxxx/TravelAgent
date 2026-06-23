@@ -3,23 +3,19 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 let map = null;
-let ws = null;
 const markers = [];
 let polylines = [];
 
 // ── 浏览器侧会话管理 ───────────────────────────────────────────────────────
-// 这里只保存 UI 历史、地图块和 A2UI 卡片。当前会话 ID 不会发送给后端，
-// 因此页面看见的历史记录不代表 WebSocket 重连后模型仍拥有相同上下文。
+// UI 历史、地图块和 A2UI 卡片保存在浏览器；session_id 同时传给后端，
+// 后端据此保存 Agent、messages 和记忆上下文。
 const STORAGE_KEY_SESSIONS = "travel_sessions_v2";   // 会话列表（替代旧的单 key 模式）
 const MAX_SESSIONS          = 50;                     // 最多保留 50 个会话
 const MAX_HISTORY_ITEMS     = 60;                     // 每个会话最多 60 条消息
 const MAX_A2UI_CARDS        = 40;                     // 每个会话最多 40 张 A2UI 卡片
-const A2UI_PREFIX           = "@@A2UI@@";
-let wsReconnectTimer = null;
-let wsReconnectDelay = 1500;
-let wsSendPending = null;
 window._a2uiSavedPlaces = [];
 let _currentSessionId = null;    // 当前活跃会话 ID
+let _activeChatRequest = null;   // { controller, sessionId, assistant, extraContent }
 
 /** 读取全部会话数据 */
 function _loadSessions() {
@@ -150,6 +146,36 @@ function appendMessage(role, text, _skipSave) {
   }
 }
 
+/** 创建一个尚未持久化的助手消息气泡，后续 token 都追加到这里。 */
+function _createStreamingAssistant() {
+  removeTyping();
+  const log = document.getElementById("chat-log");
+  const wrap = document.createElement("div");
+  wrap.className = "chat-msg chat-msg-assistant";
+
+  const label = document.createElement("span");
+  label.className = "chat-msg-label";
+  label.textContent = "助手";
+
+  const body = document.createElement("div");
+  body.className = "chat-msg-body";
+  wrap.appendChild(label);
+  wrap.appendChild(body);
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+  return { wrap: wrap, body: body, text: "" };
+}
+
+/** 把一个模型 token 追加到当前助手气泡，而不是创建多条消息。 */
+function _appendAssistantToken(state, token) {
+  if (!token) return;
+  if (!state.assistant) state.assistant = _createStreamingAssistant();
+  state.assistant.text += token;
+  state.assistant.body.innerHTML = md(stripMapBlocks(state.assistant.text));
+  const log = document.getElementById("chat-log");
+  log.scrollTop = log.scrollHeight;
+}
+
 // ── 会话级持久化 ──────────────────────────────────────────────────────────
 
 function _currentSessionData() {
@@ -159,8 +185,13 @@ function _currentSessionData() {
 }
 
 function _saveMessage(role, text) {
+  _saveMessageForSession(_currentSessionId, role, text);
+}
+
+/** SSE 完成时按发起请求的 session 保存，避免异步回调写入错误会话。 */
+function _saveMessageForSession(sessionId, role, text) {
   var data = _loadSessions();
-  var s = _currentSessionData();
+  var s = data.sessions && data.sessions[sessionId];
   if (!s) return;
   s.messages.push({ role: role, text: text, ts: Date.now() });
   if (s.messages.length > MAX_HISTORY_ITEMS) s.messages = s.messages.slice(s.messages.length - MAX_HISTORY_ITEMS);
@@ -177,6 +208,7 @@ function _saveMessage(role, text) {
 }
 
 function clearHistory() {
+  _cancelActiveStream();
   var data = _loadSessions();
   if (data.sessions && _currentSessionId) {
     delete data.sessions[_currentSessionId];
@@ -198,6 +230,7 @@ function clearHistory() {
 }
 
 function _newSession() {
+  _cancelActiveStream();
   var data = _loadSessions();
   _currentSessionId = _newSessionId();
   data.sessions = data.sessions || {};
@@ -219,6 +252,7 @@ function _newSession() {
 
 function _switchSession(sessionId) {
   if (sessionId === _currentSessionId) return;
+  _cancelActiveStream();
   var data = _loadSessions();
   if (!data.sessions || !data.sessions[sessionId]) return;
   _currentSessionId = sessionId;
@@ -236,6 +270,9 @@ function _switchSession(sessionId) {
 }
 
 function _deleteSession(sessionId) {
+  if (_activeChatRequest && _activeChatRequest.sessionId === sessionId) {
+    _cancelActiveStream();
+  }
   var data = _loadSessions();
   if (data.sessions) delete data.sessions[sessionId];
   if (data.order) data.order = data.order.filter(function (id) { return id !== sessionId; });
@@ -315,7 +352,8 @@ function handleA2UIEvent(evt) {
   }
 
   if (evt.type === "invoke_failed") {
-    appendMessage("assistant", "❌ 调用失败: " + (evt.error || "未知错误"));
+    // SSE 已通过 error 事件显示错误；这里仅保留结构化调试信息，避免重复气泡。
+    console.error("[A2UI] invoke_failed", evt.error || "未知错误");
     return;
   }
   if (evt.type === "precheck_failed") {
@@ -369,7 +407,7 @@ function _renderA2UICard(cardType, payload) {
 /** 持久化 A2UI 卡片到当前会话 */
 function _saveA2UICard(cardEntry) {
   var data = _loadSessions();
-  var s = _currentSessionData();
+  var s = data.sessions && data.sessions[_currentSessionId];
   if (!s) return;
   s.a2uiCards.push({ data: cardEntry, ts: Date.now() });
   if (s.a2uiCards.length > MAX_A2UI_CARDS) {
@@ -378,13 +416,14 @@ function _saveA2UICard(cardEntry) {
   _saveSessions(data);
 }
 
-/** 前端向 WebSocket 发送 A2UI 消息（供 a2ui-cards.js 调用）*/
-window._sendA2UIResponse = function (a2uiText) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn("[A2UI] WebSocket not open, cannot send response");
-    return;
-  }
-  ws.send(a2uiText);
+/** A2UI 表单与普通消息共用 POST + SSE 通道。 */
+window._submitA2UIResponse = function (cardId, data) {
+  return sendChatRequest({
+    type: "form_response",
+    content: "",
+    data: data || {},
+    card_id: cardId || "",
+  });
 };
 
 // ── 会话列表渲染 ───────────────────────────────────────────────────────────
@@ -486,58 +525,185 @@ document.addEventListener("click", function (e) {
   }
 });
 
-// ── WebSocket ─────────────────────────────────────────────────────────────
-function initWebSocket() {
-  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
-  const proto = window.location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(proto + "://" + window.location.host + "/ws/chat");
+// ── HTTP POST + SSE ───────────────────────────────────────────────────────
 
-  ws.onopen = () => {
-    console.log("[WS] connected");
-    wsReconnectDelay = 1500;   // 重置退避
-    // 若有待发送消息，补发
-    if (wsSendPending) {
-      const text = wsSendPending; wsSendPending = null;
-      appendMessage("user", text);
-      showTyping();
-      ws.send(text);
+function _setStreamingUi(active) {
+  var sendBtn = document.getElementById("send-btn");
+  if (!sendBtn) return;
+  if (!sendBtn.dataset.defaultHtml) sendBtn.dataset.defaultHtml = sendBtn.innerHTML;
+  if (active) {
+    sendBtn.innerHTML = "■";
+    sendBtn.title = "停止生成";
+    sendBtn.classList.add("is-streaming");
+  } else {
+    sendBtn.innerHTML = sendBtn.dataset.defaultHtml;
+    sendBtn.title = "发送";
+    sendBtn.classList.remove("is-streaming");
+  }
+}
+
+function _cancelActiveStream() {
+  if (!_activeChatRequest) return;
+  var current = _activeChatRequest;
+  _activeChatRequest = null;
+  current.controller.abort();
+  removeTyping();
+  _setStreamingUi(false);
+}
+
+/** 解析一个完整 SSE frame，支持多行 data 字段。 */
+function _parseSSEFrame(frame) {
+  var eventName = "message";
+  var dataLines = [];
+  frame.split("\n").forEach(function (line) {
+    if (!line || line.charAt(0) === ":") return;
+    var colon = line.indexOf(":");
+    var field = colon === -1 ? line : line.slice(0, colon);
+    var value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /, "");
+    if (field === "event") eventName = value;
+    if (field === "data") dataLines.push(value);
+  });
+  if (dataLines.length === 0) return null;
+  var rawData = dataLines.join("\n");
+  try {
+    return { event: eventName, data: JSON.parse(rawData) };
+  } catch (_) {
+    return { event: eventName, data: { content: rawData } };
+  }
+}
+
+/** 使用缓冲区解析网络分块，不能假设一次 read() 就得到一个完整事件。 */
+async function _readSSEStream(response, onEvent) {
+  if (!response.body) throw new Error("浏览器不支持流式响应");
+  var reader = response.body.getReader();
+  var decoder = new TextDecoder("utf-8");
+  var buffer = "";
+
+  while (true) {
+    var result = await reader.read();
+    buffer += decoder.decode(result.value || new Uint8Array(), { stream: !result.done });
+    buffer = buffer.replace(/\r\n/g, "\n");
+
+    var boundary;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      var frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      var parsed = _parseSSEFrame(frame);
+      if (parsed) onEvent(parsed.event, parsed.data);
     }
-  };
+    if (result.done) break;
+  }
 
-  ws.onmessage = (event) => {
-    const text = event.data || "";
-    // A2UI 使用文本前缀复用同一 WebSocket：带前缀的消息按结构化事件处理，
-    // 其余内容按普通助手 Markdown 回复处理。
-    if (text.startsWith(A2UI_PREFIX)) {
-      try {
-        const payload = JSON.parse(text.slice(A2UI_PREFIX.length));
-        handleA2UIEvent(payload);
-      } catch (_) {}
-      return;
+  if (buffer.trim()) {
+    var finalFrame = _parseSSEFrame(buffer);
+    if (finalFrame) onEvent(finalFrame.event, finalFrame.data);
+  }
+}
+
+function _handleStreamEvent(state, eventName, data) {
+  // 已切换会话或请求已被新请求替代时，不再修改当前页面。
+  if (_activeChatRequest !== state || state.sessionId !== _currentSessionId) return;
+
+  if (eventName === "token") {
+    removeTyping();
+    _appendAssistantToken(state, data.content || "");
+    return;
+  }
+  if (eventName === "retry") {
+    console.warn("[SSE] retry", data);
+    if (data.reset && state.assistant) {
+      state.assistant.wrap.remove();
+      state.assistant = null;
     }
-    removeTyping();
-    appendMessage("assistant", text);
-  };
-
-  ws.onerror = (err) => {
-    console.error("[WS] error", err);
-    removeTyping();
-  };
-
-  ws.onclose = (ev) => {
-    removeTyping();
-    // 非主动关闭（code 1000/1001）才重连
-    if (ev.code !== 1000 && ev.code !== 1001) {
-      appendMessage("assistant", `⚠️ 连接中断（code ${ev.code}），${(wsReconnectDelay/1000).toFixed(1)}s 后自动重连…`);
-      wsReconnectTimer = setTimeout(() => {
-        wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
-        // 当前重连会在服务端创建新的 Agent session，不会自动恢复旧 messages。
-        initWebSocket();
-      }, wsReconnectDelay);
-    } else {
-      appendMessage("assistant", "连接已关闭。");
+    showTyping();
+    return;
+  }
+  if (eventName === "memory_mode") {
+    console.log("[SSE] memory_mode", data);
+    return;
+  }
+  if (eventName === "tool_start" || eventName === "tool_end") {
+    console.log("[SSE]", eventName, data);
+    return;
+  }
+  if (eventName === "a2ui") {
+    handleA2UIEvent(data);
+    return;
+  }
+  if (eventName === "map_data" || eventName === "weather_data") {
+    var block = data.content || "";
+    if (block) {
+      state.extraContent += "\n" + block;
+      extractAndPlotMapData(block);
     }
+    return;
+  }
+  if (eventName === "error") {
+    removeTyping();
+    _appendAssistantToken(state, "\n\n❌ " + (data.message || "请求失败"));
+    return;
+  }
+  if (eventName === "done") {
+    removeTyping();
+    if (!state.completed && state.assistant) {
+      _saveMessageForSession(
+        state.sessionId,
+        "assistant",
+        state.assistant.text + state.extraContent
+      );
+      state.completed = true;
+    }
+  }
+}
+
+async function sendChatRequest(message) {
+  _cancelActiveStream();
+  var sessionId = _currentSessionId;
+  var controller = new AbortController();
+  var state = {
+    controller: controller,
+    sessionId: sessionId,
+    assistant: null,
+    extraContent: "",
+    completed: false,
   };
+  _activeChatRequest = state;
+  showTyping();
+  _setStreamingUi(true);
+
+  try {
+    var response = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        type: message.type || "message",
+        content: message.content || "",
+        data: message.data || null,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status + " " + await response.text());
+    }
+    await _readSSEStream(response, function (eventName, data) {
+      _handleStreamEvent(state, eventName, data || {});
+    });
+  } catch (error) {
+    if (error.name !== "AbortError" && _activeChatRequest === state) {
+      console.error("[SSE] request failed", error);
+      _handleStreamEvent(state, "error", { message: error.message || String(error) });
+    }
+  } finally {
+    if (_activeChatRequest === state) {
+      _activeChatRequest = null;
+      removeTyping();
+      _setStreamingUi(false);
+    }
+  }
 }
 
 // ── Map (AMap JS API v2.0) ───────────────────────────────────────────
@@ -558,6 +724,21 @@ function initMap() {
       setMapSize();
       if (map) { try { map.resize(); } catch(e) {} }
     }).observe(container);
+  }
+
+  // 地图不是聊天主链路的启动条件。云端尚未配置 JS API Key 时，
+  // 显示可理解的降级状态，天气、POI 搜索和 Agent 对话仍可正常使用。
+  if (window.TRAVEL_MAP_ENABLED === false || typeof window.AMap === "undefined") {
+    if (mapEl) {
+      mapEl.innerHTML =
+        '<div style="height:100%;display:flex;align-items:center;justify-content:center;' +
+        'padding:24px;box-sizing:border-box;text-align:center;color:#64748b;background:#f8fafc;">' +
+        '<div><div style="font-size:34px;margin-bottom:10px;">🗺️</div>' +
+        '<div style="font-weight:600;color:#334155;">地图暂未启用</div>' +
+        '<div style="font-size:13px;margin-top:6px;">配置高德 JS API Key 后自动启用；Agent 对话与天气工具不受影响。</div>' +
+        '</div></div>';
+    }
+    return;
   }
 
   try {
@@ -1023,30 +1204,16 @@ function bindUI() {
   const sendBtn = document.getElementById("send-btn");
 
   const send = () => {
+    if (_activeChatRequest) {
+      _cancelActiveStream();
+      return;
+    }
     const text = input.value.trim();
     if (!text) return;
 
-    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-      // WS 已断开，暂存消息，触发重连，连接成功后自动发送
-      wsSendPending = text;
-      input.value = "";
-      appendMessage("assistant", "⏳ 正在重新连接服务器，稍后自动发送…");
-      initWebSocket();
-      return;
-    }
-
-    if (ws.readyState === WebSocket.CONNECTING) {
-      // 正在握手，先暂存
-      wsSendPending = text;
-      input.value = "";
-      appendMessage("assistant", "⏳ 连接中，稍后自动发送…");
-      return;
-    }
-
     appendMessage("user", text);
-    showTyping();
-    ws.send(text);
     input.value = "";
+    sendChatRequest({ type: "message", content: text, data: null });
   };
 
   sendBtn.addEventListener("click", send);
@@ -1111,7 +1278,6 @@ function exportItineraryPDF() {
 // 高德 JS API 通过 <script> 同步加载，DOMContentLoaded 时已可直接使用 AMap
 window.addEventListener("DOMContentLoaded", function() {
   initMap();
-  initWebSocket();
   bindUI();
   bindSideTabs();
   _restoreHistory();

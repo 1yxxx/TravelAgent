@@ -1,0 +1,25 @@
+services:
+  travel-agent:
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: travel-agent-caddy
+    restart: unless-stopped
+    depends_on:
+      travel-agent:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:?请在 .env 中设置 DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
